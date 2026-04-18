@@ -1,14 +1,7 @@
-import sys
 from pathlib import Path
-
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / 'src'
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-from extractor import ExtractConfig, FileExtractor
+from src.extractor import ExtractConfig, FileExtractor
 
 
 def test_unsupported_extension_returns_explicit_status(tmp_path: Path) -> None:
