@@ -2,7 +2,6 @@ import os
 import json
 import cv2
 import pandas as pd
-import numpy as np
 import fitz  # PyMuPDF
 import docx
 import docx2txt
@@ -18,7 +17,6 @@ class FileExtractor:
     @classmethod
     def _get_ocr(cls) -> RapidOCR:
         if cls._ocr is None:
-            # RapidOCR автоматически определяет угол наклона текста (use_angle_cls=True при вызове)
             cls._ocr = RapidOCR()
         return cls._ocr
 
@@ -53,7 +51,7 @@ class FileExtractor:
             print(f'[!] Ошибка при обработке {os.path.basename(file_path)}: {e}')
             return ''
 
-    # --- ДОКУМЕНТЫ ---
+    # --- ДОКУМЕНТЫ (Без изменений) ---
     @staticmethod
     def _extract_pdf(file_path: str) -> str:
         text_blocks: List[str] = []
@@ -79,7 +77,6 @@ class FileExtractor:
             if text: return text
         except Exception:
             pass
-
         try:
             with open(file_path, 'rb') as f:
                 content = f.read()
@@ -97,7 +94,6 @@ class FileExtractor:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             return str(rtf_to_text(f.read()))
 
-    # --- СТРУКТУРИРОВАННЫЕ ДАННЫЕ (Таблицы в JSON) ---
     @staticmethod
     def _extract_table(file_path: str, ext: str) -> str:
         ENCODINGS = ['utf-8-sig', 'utf-8', 'cp1251', 'latin-1']
@@ -115,34 +111,24 @@ class FileExtractor:
             else:
                 df = pd.read_excel(file_path)
 
-            if df is None or df.empty:
-                return ''
+            if df is None or df.empty: return ''
 
-            # Упаковываем таблицу в JSON-маркер для быстрого парсинга заголовков в analyzer.py
-            table_data = {
-                "__is_table_data__": True,
-                "columns": {}
-            }
+            table_data = {"__is_table_data__": True, "columns": {}}
             for col in df.columns:
-                # Конвертируем в список строк, исключая NaN
                 table_data["columns"][str(col)] = df[col].dropna().astype(str).tolist()
-
             return json.dumps(table_data, ensure_ascii=False)
         except Exception as e:
-            print(f"[!] Ошибка чтения таблицы {os.path.basename(file_path)}: {e}")
             return ''
 
     @staticmethod
     def _extract_json(file_path: str) -> str:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            data = json.load(f)
-        return json.dumps(data, ensure_ascii=False)
+            return json.dumps(json.load(f), ensure_ascii=False)
 
     @staticmethod
     def _extract_html(file_path: str) -> str:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            soup = BeautifulSoup(f.read(), 'html.parser')
-            return soup.get_text(separator=' ', strip=True)
+            return BeautifulSoup(f.read(), 'html.parser').get_text(separator=' ', strip=True)
 
     @staticmethod
     def _extract_plain_text(file_path: str) -> str:
@@ -154,16 +140,25 @@ class FileExtractor:
                 continue
         return ''
 
-    # --- МЕДИА (RapidOCR) ---
+    # --- МЕДИА (Исправлено: Добавлен вертикальный проход для боковых номеров) ---
     @staticmethod
     def _extract_image(file_path: str) -> str:
         ocr = FileExtractor._get_ocr()
         try:
-            # use_angle_cls=True сам перевернет картинку, если текст боком
-            result, _ = ocr(file_path, use_angle_cls=True)
-            if result:
-                # result: [ [[box], "text", confidence], ... ]
-                return ' '.join([item[1] for item in result])
+            text_blocks = []
+
+            # 1. Горизонтальный проход
+            res_h, _ = ocr(file_path, use_angle_cls=True)
+            if res_h: text_blocks.append(' '.join([item[1] for item in res_h]))
+
+            # 2. Вертикальный проход (Специально для красного номера паспорта)
+            img = cv2.imread(file_path)
+            if img is not None:
+                img_rot = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                res_v, _ = ocr(img_rot, use_angle_cls=True)
+                if res_v: text_blocks.append(' '.join([item[1] for item in res_v]))
+
+            return ' '.join(text_blocks)
         except Exception as e:
             print(f"[!] Ошибка OCR в файле {os.path.basename(file_path)}: {e}")
         return ''
@@ -173,9 +168,8 @@ class FileExtractor:
         ocr = FileExtractor._get_ocr()
         cap = cv2.VideoCapture(file_path)
         fps_val = cap.get(cv2.CAP_PROP_FPS) or 24.0
-        max_frames = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), int(fps_val * 120))  # Макс 2 мин
-
-        step = int(fps_val * 2.0)  # 1 кадр каждые 2 секунды
+        max_frames = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), int(fps_val * 120))
+        step = int(fps_val * 2.0)
         text_blocks = []
 
         for frame_idx in range(0, max_frames, step):
@@ -184,9 +178,14 @@ class FileExtractor:
             if not ret: break
 
             try:
-                result, _ = ocr(frame, use_angle_cls=True)
-                if result:
-                    text_blocks.append(' '.join([item[1] for item in result]))
+                # Горизонтальный проход
+                res_h, _ = ocr(frame, use_angle_cls=True)
+                if res_h: text_blocks.append(' '.join([item[1] for item in res_h]))
+
+                # Вертикальный проход
+                img_rot = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                res_v, _ = ocr(img_rot, use_angle_cls=True)
+                if res_v: text_blocks.append(' '.join([item[1] for item in res_v]))
             except Exception:
                 pass
 

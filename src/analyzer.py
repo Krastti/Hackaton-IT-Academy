@@ -52,13 +52,14 @@ def normalize_phone(phone: str) -> str:
 
 class PIIAnalyzer:
     PATTERNS = {
+        # ИСПРАВЛЕНИЕ MRZ-КЛОНОВ: Правая граница (?![A-Za-zА-Яа-я0-9]) теперь жестко запрещает
+        # откусывать цифры от сплошного текста вроде 9314478268RUS...
         'passport_rf': (
             r'(?i)(?:'
             r'(?:п[аaоo0]сп[оoаa0]рт(?:ные\s+данные)?|серия(?:\s+и\s+номер)?)[:\s#№]{0,10}'
             r'\d{2}[\s\-\.,_]{0,3}\d{2}[\s\-\.,_]{0,3}\d{6}'
             r'|'
-            # Непробиваемый фолбэк: захватывает ровно 10 цифр (игнорируя блики и слипшийся текст)
-            r'(?<!\d)(?:\d{4}[\s\-_]{1,3}\d{6}|\d{2}[\s\-_]{1,3}\d{2}[\s\-_]{1,3}\d{6}|\d{10})(?!\d)'
+            r'(?<![A-Za-zА-Яа-я0-9])(?:\d{4}[\s\-_]*\d{6}|\d{2}[\s\-_]*\d{2}[\s\-_]*\d{6}|\d{10})(?![A-Za-zА-Яа-я0-9])'
             r')'
         ),
         'passport_intl': r'(?:P|I|A|C|V)[A-Z<]{1,2}[A-Z<]{3}[A-Z0-9<]{10,50}',
@@ -76,7 +77,6 @@ class PIIAnalyzer:
         try:
             self.nlp = spacy.load('ru_core_news_lg', disable=['parser', 'attribute_ruler'])
         except OSError:
-            print("[!] Ошибка: модель SpaCy не найдена. Выполните: python -m spacy download ru_core_news_lg")
             self.nlp = None
 
     def _heal_ocr_digits(self, text: str) -> str:
@@ -91,7 +91,6 @@ class PIIAnalyzer:
             norm = re.sub(r'\D', '', match)
             return norm if is_snils_valid(norm) else None
 
-        # Строгая фильтрация паспортов по форматам (жесткая проверка длины)
         if key == 'passport_rf':
             cleaned = re.sub(r'\D', '', match)
             return cleaned if len(cleaned) == 10 else None
@@ -109,35 +108,35 @@ class PIIAnalyzer:
 
     def _extract_fios_spacy(self, text: str) -> set:
         if not self.nlp: return set()
-        safe_text = text[:100000]
-        doc = self.nlp(safe_text)
-
+        doc = self.nlp(text[:100000])
         fios = set()
         for ent in doc.ents:
             if ent.label_ == 'PER':
                 parts = ent.lemma_.split()
-                if len(parts) >= 2 and all(len(p) > 2 for p in parts):
-                    if not re.match(r'^[A-Za-z\s]+$', ent.lemma_):
-                        fios.add(ent.lemma_.title())
+                if len(parts) >= 2 and all(len(p) > 2 for p in parts) and not re.match(r'^[A-Za-z\s]+$', ent.lemma_):
+                    fios.add(ent.lemma_.title())
         return fios
 
+    # ИСПРАВЛЕНИЕ ФИО: Бронебойный морфологический поиск (спасает от КАПСА и разрывов строк)
     def _extract_fios_heuristics(self, text: str) -> set:
         fios = set()
-        clean_text = re.sub(r'[^а-яА-ЯёЁa-zA-Z\s]', ' ', text)
 
-        # 1. Жесткий поиск по структуре документа (Фамилия Имя Отчество)
-        match = re.search(r'(?i)фамилия\s+([а-яёa-z]+)\s+имя\s+([а-яёa-z]+)(?:\s+отчество\s+([а-яёa-z]+))?', clean_text)
-        if match:
-            f, i = match.group(1).title(), match.group(2).title()
-            o = match.group(3).title() if match.group(3) else ""
+        # 1. Жесткая регулярка для русских ФИО (Иванов Иван Иванович)
+        # Ищет типичные окончания фамилий (-ов, -ев, -ин) и отчеств (-вич, -вна)
+        pattern_fio = r'\b([А-ЯЁа-яё]{2,}(?:ов|ев|ёв|ин|ын|ский|ская|ова|ева|ина|ына|ых|их))\s+([А-ЯЁа-яё]{2,})\s+([А-ЯЁа-яё]{2,}(?:вич|вна|ич|ична|тична))\b'
+        for match in re.finditer(pattern_fio, text, re.IGNORECASE):
+            fios.add(f"{match.group(1).title()} {match.group(2).title()} {match.group(3).title()}")
+
+        # 2. Поиск по ключевым словам (если ФИО раскидано по строкам)
+        f_match = re.search(r'(?i)фамилия[\s\n:\|]+([А-ЯЁа-яёA-Za-z\-]{2,})', text)
+        i_match = re.search(r'(?i)имя[\s\n:\|]+([А-ЯЁа-яёA-Za-z\-]{2,})', text)
+        o_match = re.search(r'(?i)отчество[\s\n:\|]+([А-ЯЁа-яёA-Za-z\-]{2,})', text)
+
+        if f_match and i_match:
+            f = f_match.group(1).title()
+            i = i_match.group(1).title()
+            o = o_match.group(1).title() if o_match else ""
             fios.add(f"{f} {i} {o}".strip())
-
-        # 2. Фолбэк: поиск классических ФИО (Иванов Иван Иванович), если SpaCy сбоит из-за КАПСА
-        title_text = re.sub(r'\s+', ' ', text).title()
-        for m in re.finditer(
-                r'\b([А-ЯЁ][а-яё]+(?:ов|ев|ин|ын|ский|ая|яя))\s+([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+(?:вич|вна|ич|на))\b',
-                title_text):
-            fios.add(f"{m.group(1)} {m.group(2)} {m.group(3)}")
 
         return fios
 
@@ -153,14 +152,10 @@ class PIIAnalyzer:
             if not is_duplicate:
                 unique_items.append(item)
 
-        # Если найден и визуальный номер (10 цифр), и MRZ (длинная строка),
-        # оставляем только визуальный, чтобы не было дублей одного и того же паспорта
         mrz_items = [it for it in unique_items if len(it) > 15]
         visual_items = [it for it in unique_items if it not in mrz_items]
 
-        if mrz_items and visual_items:
-            return set(visual_items)
-
+        if mrz_items and visual_items: return set(visual_items)
         return set(unique_items)
 
     def analyze_text(self, text: str) -> Dict[str, Any]:
@@ -174,16 +169,13 @@ class PIIAnalyzer:
             try:
                 table_data = json.loads(text)
                 columns = table_data.get("columns", {})
-
                 fio_headers = ['фио', 'fio', 'имя', 'фамилия', 'отчество', 'сотрудник', 'клиент', 'name', 'full name']
                 flat_text_parts = []
 
                 for col_name, values in columns.items():
-                    col_lower = col_name.lower()
-                    if any(h in col_lower for h in fio_headers):
+                    if any(h in col_name.lower() for h in fio_headers):
                         for val in values:
-                            if len(val.split()) >= 2:
-                                findings['fio'].add(val.strip().title())
+                            if len(val.split()) >= 2: findings['fio'].add(val.strip().title())
                     else:
                         flat_text_parts.extend(values)
 
@@ -194,35 +186,29 @@ class PIIAnalyzer:
 
         # === ИЗВЛЕЧЕНИЕ ФИО ===
         if run_ner:
-            # Сжимаем переносы строк и делаем Title Case для SpaCy
             title_text = re.sub(r'\s+', ' ', text_for_regex).title()
             findings['fio'].update(self._extract_fios_spacy(title_text))
 
-        # Запускаем железобетонные эвристики на оригинальном тексте
         findings['fio'].update(self._extract_fios_heuristics(text_for_regex))
 
+        # === РЕГУЛЯРКИ И ПАСПОРТА ===
         text_for_digits = self._heal_ocr_digits(text_for_regex)
 
-        # === ПАСПОРТА (ХАК ПРОТИВ MRZ) ===
-        # 1. Спасаем MRZ-строки первыми
         for match in re.findall(self.PATTERNS['passport_intl'], text_for_regex):
             processed = self._process_match('passport_intl', match)
             if processed: findings['passport'].add(processed)
 
-        # 2. Физически вырезаем MRZ из текста, чтобы регулярка паспорта РФ не сошла с ума
+        # Вырезаем MRZ зону, чтобы она не фонила
         safe_text_for_regex = re.sub(r'[A-Z0-9<]{25,}', ' ', text_for_regex, flags=re.IGNORECASE)
         safe_text_for_digits = re.sub(r'[A-Z0-9<]{25,}', ' ', text_for_digits, flags=re.IGNORECASE)
 
-        # === ОСТАЛЬНЫЕ РЕГУЛЯРКИ ===
         for key, pattern in self.PATTERNS.items():
-            if key == 'passport_intl': continue  # Уже нашли
-
+            if key == 'passport_intl': continue
             target_text = safe_text_for_regex if key in ('email', 'driver_license') else safe_text_for_digits
             for match in re.findall(pattern, target_text):
                 save_key = 'passport' if key.startswith('passport') else key
                 processed = self._process_match(key, match)
-                if processed:
-                    findings[save_key].add(processed)
+                if processed: findings[save_key].add(processed)
 
         for match in ADDRESS_RE.findall(safe_text_for_regex):
             findings['address'].add(re.sub(r'\s+', ' ', match).strip())
@@ -230,12 +216,9 @@ class PIIAnalyzer:
         for match in SPECIAL_PII_RE.findall(safe_text_for_regex):
             findings['special_pii'].add(match.strip().lower())
 
-        # Дедупликация опечаток OCR и устранение коллизий
         for key in ['passport', 'inn', 'snils', 'phone', 'bank_card']:
-            if findings[key]:
-                findings[key] = self._deduplicate_items(findings[key])
+            if findings[key]: findings[key] = self._deduplicate_items(findings[key])
 
-        # 10-значный ИНН юрлица мог случайно попасть в паспорта. Убираем.
         if findings['inn'] and findings['passport']:
             findings['passport'] = findings['passport'] - findings['inn']
 
