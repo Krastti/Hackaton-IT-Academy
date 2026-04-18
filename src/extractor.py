@@ -2,6 +2,7 @@ import logging
 import pdfplumber
 import pandas as pd
 import pytesseract
+import easyocr
 
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -69,9 +70,12 @@ class PlainTextExtractor(BaseExtractor):
 
 class ImageExtractor(BaseExtractor):
     """OCR для изображений через pytesseract."""
+    def __init__(self):
+        self._reader = easyocr.Reader(["en", "ru"], gpu=False)
+
     def extract(self, file_path: Path) -> str:
-        image = Image.open(file_path)
-        result = pytesseract.image_to_string(image, lang="rus+eng")
+        results = self._reader.readtext(str(file_path), detail=0)
+        result = "\n".join(results)
         logger.info("Изображение распознано: %s (%d символов)", file_path.name, len(result))
         return result
 
