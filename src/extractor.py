@@ -1,27 +1,26 @@
 import os
 import json
-import cv2  # type: ignore
-import easyocr  # type: ignore
-import pandas as pd  # type: ignore
+import cv2
+import pandas as pd
 import numpy as np
-import fitz  # PyMuPDF  # type: ignore
-import docx  # type: ignore
-import docx2txt  # type: ignore
-from bs4 import BeautifulSoup  # type: ignore
-from striprtf.striprtf import rtf_to_text  # type: ignore
-from typing import List, Any, Dict, Optional, Iterator
-import itertools
+import fitz  # PyMuPDF
+import docx
+import docx2txt
+from bs4 import BeautifulSoup
+from striprtf.striprtf import rtf_to_text
+from typing import List, Any, Optional
+from rapidocr_onnxruntime import RapidOCR
 
 
 class FileExtractor:
-
-    _reader: Optional[easyocr.Reader] = None
+    _ocr: Optional[RapidOCR] = None
 
     @classmethod
-    def _get_reader(cls) -> easyocr.Reader:
-        if cls._reader is None:
-            cls._reader = easyocr.Reader(['ru', 'en'], gpu=False)
-        return cls._reader
+    def _get_ocr(cls) -> RapidOCR:
+        if cls._ocr is None:
+            # RapidOCR автоматически определяет угол наклона текста (use_angle_cls=True при вызове)
+            cls._ocr = RapidOCR()
+        return cls._ocr
 
     @staticmethod
     def extract_text(file_path: str) -> str:
@@ -54,10 +53,7 @@ class FileExtractor:
             print(f'[!] Ошибка при обработке {os.path.basename(file_path)}: {e}')
             return ''
 
-    # ------------------------------------------------------------------
-    # Документы
-    # ------------------------------------------------------------------
-
+    # --- ДОКУМЕНТЫ ---
     @staticmethod
     def _extract_pdf(file_path: str) -> str:
         text_blocks: List[str] = []
@@ -69,7 +65,6 @@ class FileExtractor:
     @staticmethod
     def _extract_docx(file_path: str) -> str:
         doc = docx.Document(file_path)
-        # Параграфы + ячейки таблиц
         parts: List[str] = [p.text for p in doc.paragraphs]
         for table in doc.tables:
             for row in table.rows:
@@ -79,32 +74,22 @@ class FileExtractor:
 
     @staticmethod
     def _extract_doc(file_path: str) -> str:
-        """Извлечение текста из .doc.
-        Сначала пробуем docx2txt (если это docx со старым расширением),
-        затем фоллбэк на чтение бинарных строк (вытягиваем кириллицу и цифры)."""
         try:
             text = docx2txt.process(file_path)
-            if text:
-                return text
+            if text: return text
         except Exception:
-            pass  # Это нормально для старых .doc файлов
+            pass
 
-        # Фолбэк: читаем бинарный файл и ищем в нем текстовые данные
         try:
             with open(file_path, 'rb') as f:
                 content = f.read()
-            # Пытаемся декодировать частые кодировки Word
             text_utf16 = content.decode('utf-16-le', errors='ignore')
             text_cp1251 = content.decode('cp1251', errors='ignore')
-
-            # Очищаем от бинарного мусора, оставляем буквы, цифры и пунктуацию
             import re
             cleaned_utf16 = re.sub(r'[^\w\s@.,-]', ' ', text_utf16)
             cleaned_cp1251 = re.sub(r'[^\w\s@.,-]', ' ', text_cp1251)
-
             return cleaned_utf16 + " " + cleaned_cp1251
-        except Exception as e:
-            print(f'[!] Ошибка при чтении {os.path.basename(file_path)}: {e}')
+        except Exception:
             return ''
 
     @staticmethod
@@ -112,38 +97,37 @@ class FileExtractor:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             return str(rtf_to_text(f.read()))
 
-    # ------------------------------------------------------------------
-    # Структурированные данные
-    # ------------------------------------------------------------------
-
+    # --- СТРУКТУРИРОВАННЫЕ ДАННЫЕ (Таблицы в JSON) ---
     @staticmethod
     def _extract_table(file_path: str, ext: str) -> str:
-        """Чтение таблиц с последовательным перебором кодировок для CSV."""
-        ENCODINGS: List[str] = ['utf-8-sig', 'utf-8', 'cp1251', 'latin-1']
+        ENCODINGS = ['utf-8-sig', 'utf-8', 'cp1251', 'latin-1']
+        df = None
         try:
             if ext == '.csv':
-                df: Optional[Any] = None
                 for enc in ENCODINGS:
                     try:
-                        df = pd.read_csv(
-                            file_path,
-                            on_bad_lines='skip',
-                            encoding=enc,
-                            low_memory=False,
-                        )
-                        break  # успешно прочитали
-                    except (UnicodeDecodeError, Exception):
+                        df = pd.read_csv(file_path, on_bad_lines='skip', encoding=enc, low_memory=False)
+                        break
+                    except Exception:
                         continue
-                if df is None:
-                    return ''
             elif ext == '.parquet':
                 df = pd.read_parquet(file_path)
             else:
                 df = pd.read_excel(file_path)
 
-            # ИСПРАВЛЕНИЕ: Заменяем сверхмедленный to_string() на быстрый to_csv()
-            # Это мгновенно склеит таблицу через пробелы без вычислений ширины колонок
-            return df.to_csv(index=False, sep=' ', na_rep='')
+            if df is None or df.empty:
+                return ''
+
+            # Упаковываем таблицу в JSON-маркер для быстрого парсинга заголовков в analyzer.py
+            table_data = {
+                "__is_table_data__": True,
+                "columns": {}
+            }
+            for col in df.columns:
+                # Конвертируем в список строк, исключая NaN
+                table_data["columns"][str(col)] = df[col].dropna().astype(str).tolist()
+
+            return json.dumps(table_data, ensure_ascii=False)
         except Exception as e:
             print(f"[!] Ошибка чтения таблицы {os.path.basename(file_path)}: {e}")
             return ''
@@ -170,105 +154,41 @@ class FileExtractor:
                 continue
         return ''
 
-    # ------------------------------------------------------------------
-    # Медиафайлы (OCR)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _preprocess_for_ocr(img: Any) -> Any:
-        """ЧБ + адаптивный порог для улучшения распознавания документов.
-
-        Адаптивный порог лучше equalizeHist для неравномерного освещения
-        (документы с тенями, блики, тёмные края).
-        """
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        processed = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            blockSize=31, C=10
-        )
-        return cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
-
+    # --- МЕДИА (RapidOCR) ---
     @staticmethod
     def _extract_image(file_path: str) -> str:
-        """Двойной проход EasyOCR: горизонталь + поворот на 90°."""
-        reader = FileExtractor._get_reader()
-
+        ocr = FileExtractor._get_ocr()
         try:
-            img_array = np.fromfile(file_path, dtype=np.uint8)
-            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            # use_angle_cls=True сам перевернет картинку, если текст боком
+            result, _ = ocr(file_path, use_angle_cls=True)
+            if result:
+                # result: [ [[box], "text", confidence], ... ]
+                return ' '.join([item[1] for item in result])
         except Exception as e:
-            print(f"[!] Ошибка чтения файла {file_path} через numpy: {e}")
-            return ''
-
-        if img is None:
-            print(f"[!] OpenCV не смог декодировать изображение: {file_path}")
-            return ''
-
-        img_proc = FileExtractor._preprocess_for_ocr(img)
-
-        # Запрещаем EasyOCR плодить процессы параметром workers=0
-        try:
-            res_h: List[str] = reader.readtext(img_proc, detail=0, paragraph=True, workers=0)
-            text_horizontal: str = ' '.join(res_h)
-
-            img_rotated = cv2.rotate(img_proc, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            res_v: List[str] = reader.readtext(img_rotated, detail=0, paragraph=True, workers=0)
-            text_vertical: str = ' '.join(res_v)
-        except Exception as e:
-            print(f"[!] Внутренняя ошибка OCR: {e}")
-            return ''
-
-        return text_horizontal + ' ' + text_vertical
+            print(f"[!] Ошибка OCR в файле {os.path.basename(file_path)}: {e}")
+        return ''
 
     @staticmethod
     def _extract_video(file_path: str) -> str:
-        """OCR ключевых кадров: с логированием сырого текста."""
-        reader = FileExtractor._get_reader()
+        ocr = FileExtractor._get_ocr()
         cap = cv2.VideoCapture(file_path)
-        fps_raw: Any = cap.get(cv2.CAP_PROP_FPS)
-        fps_val: float = float(fps_raw) if fps_raw and fps_raw > 0 else 24.0
+        fps_val = cap.get(cv2.CAP_PROP_FPS) or 24.0
+        max_frames = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), int(fps_val * 120))  # Макс 2 мин
 
-        total_frames: int = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        total_seconds: float = total_frames / fps_val
-        max_seconds: float = min(total_seconds, 120.0)
+        step = int(fps_val * 2.0)  # 1 кадр каждые 2 секунды
+        text_blocks = []
 
-        step: float = fps_val * 2.0
-        text_blocks: List[str] = []
-        frame_idx: int = 0
-
-        while True:
+        for frame_idx in range(0, max_frames, step):
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
-            if not ret:
-                break
+            if not ret: break
 
-            current_sec: float = frame_idx / fps_val
-            if current_sec > max_seconds:
-                break
-
-            frame_processed = FileExtractor._preprocess_for_ocr(frame)
-            frame_texts = []
-
-            # Запрещаем EasyOCR плодить процессы параметром workers=0
             try:
-                result_h: List[str] = reader.readtext(frame_processed, detail=0, paragraph=True, workers=0)
-                if result_h:
-                    text_h = ' '.join(result_h)
-                    text_blocks.append(text_h)
-                    frame_texts.append(f"[Гориз]: {text_h}")
-
-                frame_rotated = cv2.rotate(frame_processed, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                result_v: List[str] = reader.readtext(frame_rotated, detail=0, paragraph=True, workers=0)
-                if result_v:
-                    text_v = ' '.join(result_v)
-                    text_blocks.append(text_v)
-                    frame_texts.append(f"[Верт]: {text_v}")
-            except Exception as e:
-                print(f"[!] Внутренняя ошибка OCR при чтении кадра: {e}")
-
-            frame_idx = int(frame_idx + step)
+                result, _ = ocr(frame, use_angle_cls=True)
+                if result:
+                    text_blocks.append(' '.join([item[1] for item in result]))
+            except Exception:
+                pass
 
         cap.release()
         return ' '.join(text_blocks)

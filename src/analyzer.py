@@ -1,55 +1,9 @@
 import re
-import sys
 import difflib
+import json
 from typing import Dict, List, Any, Optional
+import spacy
 
-import pymorphy3
-
-sys.modules['pymorphy2'] = pymorphy3
-sys.modules['pymorphy2.analyzer'] = pymorphy3.analyzer
-
-from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc
-
-
-def is_luhn_valid(card: str) -> bool:
-    digits = [int(d) for d in str(card) if d.isdigit()]
-    if len(digits) < 13:
-        return False
-
-    odd_sum = sum(d * 2 - 9 if d * 2 > 9 else d * 2 for d in digits[-2::-2])
-    even_sum = sum(digits[-1::-2])
-    return (odd_sum + even_sum) % 10 == 0
-
-
-def is_snils_valid(snils: str) -> bool:
-    if len(snils) != 11 or not snils.isdigit():
-        return False
-
-    num, control = snils[:9], int(snils[9:])
-    if int(num) <= 1001998:
-        return True
-
-    checksum = sum(int(d) * (9 - i) for i, d in enumerate(num)) % 101
-    return (0 if checksum in (100, 101) else checksum) == control
-
-
-def normalize_phone(phone: str) -> str:
-    digits = re.sub(r'\D', '', phone)
-    if len(digits) == 11 and digits.startswith('8'):
-        return '7' + digits[1:]
-    return '7' + digits if len(digits) == 10 else digits
-
-
-def normalize_gov_id(gov_id: str) -> str:
-    return re.sub(r'\D', '', gov_id)
-
-
-def clean_ocr_text_for_ner(raw_text: str) -> str:
-    text = re.sub(r'[~|`^_\\]', ' ', raw_text)
-    return " ".join(word.capitalize() for word in re.sub(r'[a-zA-Z]', '', text).split())
-
-
-# ИСПРАВЛЕНИЕ 1: Жесткие ограничения на длину слов (\w{0,30} вместо \w+)
 _SPECIAL_KW = [
     r'\bдиагноз', r'\bдиабет', r'\bонкол\w{0,30}', r'\bвич\b', r'\bспид\b',
     r'\bинвалид\w{0,30}', r'\bгруппа\s{1,5}крови', r'\bанализ\s{1,5}крови',
@@ -64,10 +18,8 @@ _SPECIAL_KW = [
     r'\bполитическ\w{0,30}\s{1,5}(?:взгляд|убежден|позиц)\w{0,30}',
     r'\bнациональност\w{0,30}', r'\bрасов\w{0,30}', r'\bэтническ\w{0,30}'
 ]
-
 SPECIAL_PII_RE = re.compile('|'.join(_SPECIAL_KW), re.IGNORECASE)
 
-# ИСПРАВЛЕНИЕ 2: Защита от поиска адресов в мегабайтах мусора
 ADDRESS_RE = re.compile(
     r'(?:г\.|город|ул\.|улица|пр-?т\.?|проспект|пер\.|переулок|'
     r'б-?р\.?|бульвар|пл\.|площадь|шоссе|набережная)'
@@ -76,27 +28,42 @@ ADDRESS_RE = re.compile(
 )
 
 
+def is_luhn_valid(card: str) -> bool:
+    digits = [int(d) for d in str(card) if d.isdigit()]
+    if len(digits) < 13: return False
+    odd_sum = sum(d * 2 - 9 if d * 2 > 9 else d * 2 for d in digits[-2::-2])
+    even_sum = sum(digits[-1::-2])
+    return (odd_sum + even_sum) % 10 == 0
+
+
+def is_snils_valid(snils: str) -> bool:
+    if len(snils) != 11 or not snils.isdigit(): return False
+    num, control = snils[:9], int(snils[9:])
+    if int(num) <= 1001998: return True
+    checksum = sum(int(d) * (9 - i) for i, d in enumerate(num)) % 101
+    return (0 if checksum in (100, 101) else checksum) == control
+
+
+def normalize_phone(phone: str) -> str:
+    digits = re.sub(r'\D', '', phone)
+    if len(digits) == 11 and digits.startswith('8'): return '7' + digits[1:]
+    return '7' + digits if len(digits) == 10 else digits
+
+
 class PIIAnalyzer:
     PATTERNS = {
-        # ИСПРАВЛЕНИЕ 3: Защита от бесконечного перебора пробелов
         'passport_rf': (
             r'(?i)(?:'
             r'(?:п[аaоo0]сп[оoаa0]рт(?:ные\s+данные)?|серия(?:\s+и\s+номер)?)[:\s#№]{0,10}'
-            r'\d{2}[\s\-\.,_]{0,5}\d{2}[\s\-\.,_]{0,5}\d{6}'
+            r'\d{2}[\s\-\.,_]{0,3}\d{2}[\s\-\.,_]{0,3}\d{6}'
             r'|'
-            r'(?<!\d)(?:\d{2}[\s\-\.,_]{1,5}\d{2}[\s\-\.,_]{1,5}\d{6})(?!\d)'
+            # Непробиваемый фолбэк: захватывает ровно 10 цифр (игнорируя блики и слипшийся текст)
+            r'(?<!\d)(?:\d{4}[\s\-_]{1,3}\d{6}|\d{2}[\s\-_]{1,3}\d{2}[\s\-_]{1,3}\d{6}|\d{10})(?!\d)'
             r')'
         ),
-        'passport_intl': (
-            r'(?i)(?:'
-            r'(?:P|I|A|C|V)[A-Z<]{1,2}[A-Z<]{3}[A-Z0-9<]{10,50}'
-            r'|'
-            r'(?:passport|document\s*no\.?)[^A-Za-z0-9А-Яа-я]{0,10}[A-Z0-9]{6,12}\b'
-            r')'
-        ),
+        'passport_intl': r'(?:P|I|A|C|V)[A-Z<]{1,2}[A-Z<]{3}[A-Z0-9<]{10,50}',
         'snils': r'\b\d{3}[-\s]?\d{3}[-\s]?\d{3}[-\s]\d{2}\b',
         'inn': r'(?i)(?:инн)[:\s#№]{0,10}[\d]{10,12}|\b\d{12}\b',
-        # ИСПРАВЛЕНИЕ 4: Лимиты на email, чтобы не зависать на строках из 1000 точек
         'email': r'[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,64}\.[A-Za-z]{2,7}',
         'phone': r'\b(?:\+7|8)[-\s]?\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{2}[-\s]?\d{2}\b',
         'bank_card': r'\b(?:\d{4}[-\s]?){3}\d{4}\b',
@@ -106,25 +73,89 @@ class PIIAnalyzer:
     }
 
     def __init__(self):
-        self.segmenter = Segmenter()
-        self.morph_vocab = MorphVocab()
-        self.emb = NewsEmbedding()
-        self.ner_tagger = NewsNERTagger(self.emb)
+        try:
+            self.nlp = spacy.load('ru_core_news_lg', disable=['parser', 'attribute_ruler'])
+        except OSError:
+            print("[!] Ошибка: модель SpaCy не найдена. Выполните: python -m spacy download ru_core_news_lg")
+            self.nlp = None
 
-    def _deduplicate_ids(self, items: set, threshold: float = 0.85) -> set:
+    def _heal_ocr_digits(self, text: str) -> str:
+        replacements = {'O': '0', 'о': '0', 'О': '0', 'З': '3', 'з': '3', 'B': '8', 'В': '8', 'I': '1', 'l': '1',
+                        'S': '5'}
+        for old, new in replacements.items(): text = text.replace(old, new)
+        return text
+
+    def _process_match(self, key: str, match: str) -> Optional[str]:
+        if key == 'bank_card': return re.sub(r'\D', '', match) if is_luhn_valid(match) else None
+        if key == 'snils':
+            norm = re.sub(r'\D', '', match)
+            return norm if is_snils_valid(norm) else None
+
+        # Строгая фильтрация паспортов по форматам (жесткая проверка длины)
+        if key == 'passport_rf':
+            cleaned = re.sub(r'\D', '', match)
+            return cleaned if len(cleaned) == 10 else None
+        if key == 'passport_intl':
+            cleaned = re.sub(r'[^A-Z0-9<]', '', match.upper())
+            return cleaned if len(cleaned) > 15 else None
+
+        if key == 'inn': return re.sub(r'\D', '', match)
+        if key == 'phone': return normalize_phone(match)
+        if key in ('bik', 'cvv'):
+            digits = re.sub(r'\D', '', match)
+            return digits if digits else None
+        if key in ('email', 'driver_license'): return match.strip()
+        return None
+
+    def _extract_fios_spacy(self, text: str) -> set:
+        if not self.nlp: return set()
+        safe_text = text[:100000]
+        doc = self.nlp(safe_text)
+
+        fios = set()
+        for ent in doc.ents:
+            if ent.label_ == 'PER':
+                parts = ent.lemma_.split()
+                if len(parts) >= 2 and all(len(p) > 2 for p in parts):
+                    if not re.match(r'^[A-Za-z\s]+$', ent.lemma_):
+                        fios.add(ent.lemma_.title())
+        return fios
+
+    def _extract_fios_heuristics(self, text: str) -> set:
+        fios = set()
+        clean_text = re.sub(r'[^а-яА-ЯёЁa-zA-Z\s]', ' ', text)
+
+        # 1. Жесткий поиск по структуре документа (Фамилия Имя Отчество)
+        match = re.search(r'(?i)фамилия\s+([а-яёa-z]+)\s+имя\s+([а-яёa-z]+)(?:\s+отчество\s+([а-яёa-z]+))?', clean_text)
+        if match:
+            f, i = match.group(1).title(), match.group(2).title()
+            o = match.group(3).title() if match.group(3) else ""
+            fios.add(f"{f} {i} {o}".strip())
+
+        # 2. Фолбэк: поиск классических ФИО (Иванов Иван Иванович), если SpaCy сбоит из-за КАПСА
+        title_text = re.sub(r'\s+', ' ', text).title()
+        for m in re.finditer(
+                r'\b([А-ЯЁ][а-яё]+(?:ов|ев|ин|ын|ский|ая|яя))\s+([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+(?:вич|вна|ич|на))\b',
+                title_text):
+            fios.add(f"{m.group(1)} {m.group(2)} {m.group(3)}")
+
+        return fios
+
+    def _deduplicate_items(self, items: set, threshold: float = 0.65) -> set:
+        sorted_items = sorted(list(items), key=len, reverse=True)
         unique_items = []
-        for item in items:
+        for item in sorted_items:
             is_duplicate = False
-            for u_item in unique_items:
+            for i, u_item in enumerate(unique_items):
                 if difflib.SequenceMatcher(None, item, u_item).ratio() > threshold:
-                    if len(item) > len(u_item):
-                        unique_items[unique_items.index(u_item)] = item
                     is_duplicate = True
                     break
             if not is_duplicate:
                 unique_items.append(item)
 
-        mrz_items = [it for it in unique_items if re.match(r'(?i)^[PIACV][A-Z]', it) and len(it) > 15]
+        # Если найден и визуальный номер (10 цифр), и MRZ (длинная строка),
+        # оставляем только визуальный, чтобы не было дублей одного и того же паспорта
+        mrz_items = [it for it in unique_items if len(it) > 15]
         visual_items = [it for it in unique_items if it not in mrz_items]
 
         if mrz_items and visual_items:
@@ -132,180 +163,88 @@ class PIIAnalyzer:
 
         return set(unique_items)
 
-    def _extract_names_from_mrz(self, text: str) -> set:
-        names = set()
-        # Обрезаем входной текст, чтобы не пытаться удалять пробелы из 50 МБ
-        safe_text = text[:10000].upper()
-        no_space_text = re.sub(r'[\s\n]+', '', safe_text)
-
-        mrz_match = re.search(
-            r'(?:P|I|A|C|V)[A-Z<KCE«\(]{1,2}[A-Z]{3}([A-Z0-9]+)[<KCE«\(]{2}([A-Z0-9<KCE«\(]+)',
-            no_space_text
-        )
-
-        if mrz_match:
-            surname_raw = mrz_match.group(1)
-            given_raw = mrz_match.group(2)
-
-            clean_surname = re.sub(r'[<KCE«\(]+', ' ', surname_raw).strip()
-            given_split = re.split(r'[<KCE«\(]{3,}', given_raw)
-            clean_given = re.sub(r'[<KCE«\(]+', ' ', given_split[0]).strip()
-
-            if clean_surname and clean_given:
-                tr_map = str.maketrans('8301', 'YZOI')
-                clean_surname = clean_surname.translate(tr_map)
-                clean_given = clean_given.translate(tr_map)
-
-                names.add(f"{clean_surname} {clean_given}".title())
-
-        return names
-
-    def _extract_foreign_pii_by_anchors(self, text: str) -> Dict[str, set]:
-        anchored_data = {'fio': set(), 'passport': set()}
-
-        # ИСПРАВЛЕНИЕ 5: Ограничиваем якоря, чтобы не зависать
-        surnames = re.findall(r'(?i)\b(?:surname|last name|nom|фамилия)[\s:;\.\|]{1,20}([A-ZА-Я]{2,}(?:[- ][A-ZА-Я]{2,})?)', text)
-        names = re.findall(r'(?i)\b(?:given names?|first name|name|pr[eé]noms?|имя)[\s:;\.\|]{1,20}([A-ZА-Я]{2,}(?:[\s-][A-ZА-Я]{2,})?)', text)
-
-        if surnames and names:
-            anchored_data['fio'].add(f"{surnames[0].strip()} {names[0].strip()}".title())
-        elif surnames:
-            anchored_data['fio'].add(surnames[0].strip().title())
-        elif names:
-            anchored_data['fio'].add(names[0].strip().title())
-
-        doc_nos = re.findall(
-            r'(?i)\b(?:document no|passport no|id no|identity no|document number|номер документа)[\s:;\.\|№#]{1,20}([A-Z0-9]{6,14})\b',
-            text)
-        for doc in doc_nos:
-            cleaned = re.sub(r'[^A-Z0-9]', '', doc.upper())
-            if len(cleaned) >= 6:
-                anchored_data['passport'].add(cleaned)
-
-        return anchored_data
-
-    def _heal_ocr_digits(self, text: str) -> str:
-        replacements = {
-            'O': '0', 'о': '0', 'О': '0',
-            'З': '3', 'з': '3',
-            'B': '8', 'В': '8',
-            'I': '1', 'l': '1',
-            'S': '5'
-        }
-        for old, new in replacements.items():
-            text = text.replace(old, new)
-        return text
-
-    def _process_match(self, key: str, match: str) -> Optional[str]:
-        if key == 'bank_card':
-            return normalize_gov_id(match) if is_luhn_valid(match) else None
-        if key == 'snils':
-            norm = normalize_gov_id(match)
-            return norm if is_snils_valid(norm) else None
-
-        if key == 'passport':
-            cleaned = re.sub(r'(?i)(паспортные данные|паспорт|серия и номер|серия|passport|document no\.?)', '', match)
-            cleaned = re.sub(r'[^A-Za-zА-Яа-я0-9]', '', cleaned)
-            return cleaned if len(cleaned) >= 6 else None
-
-        if key == 'inn':
-            return normalize_gov_id(match)
-        if key == 'phone':
-            return normalize_phone(match)
-        if key in ('bik', 'cvv'):
-            digits = re.sub(r'\D', '', match)
-            return digits if digits else None
-        if key in ('email', 'driver_license'):
-            return match.strip()
-        return None
-
-    def _extract_fios(self, text: str) -> List[str]:
-        # Нейросеть не выдержит больше 50к символов
-        safe_text = text[:5000]
-        doc = Doc(clean_ocr_text_for_ner(safe_text))
-        doc.segment(self.segmenter)
-        doc.tag_ner(self.ner_tagger)
-
-        fio_candidates = {}
-        for span in doc.spans:
-            if span.type != 'PER':
-                continue
-
-            span.normalize(self.morph_vocab)
-            if not span.normal:
-                continue
-
-            words = span.normal.split()[:3]
-            if len(words) >= 2 and all(len(w) >= 4 for w in words):
-                name = ' '.join(words)
-                k = words[0].lower()
-                if len(name) > len(fio_candidates.get(k, '')):
-                    fio_candidates[k] = name
-
-        final_fios = []
-        for name in fio_candidates.values():
-            for i, ext in enumerate(final_fios):
-                if difflib.SequenceMatcher(None, name.lower(), ext.lower()).ratio() > 0.6:
-                    if len(name) > len(ext):
-                        final_fios[i] = name
-                    break
-            else:
-                final_fios.append(name)
-
-        return final_fios
-
     def analyze_text(self, text: str) -> Dict[str, Any]:
-        if len(text) > 500000:
-            text = text[:500000]
-
         actual_keys = set(k if not k.startswith('passport') else 'passport' for k in self.PATTERNS)
-
-        # 1. ДОБАВЛЕНО 'special_pii' В МАССИВ FINDINGS
         findings = {k: set() for k in actual_keys | {'fio', 'address', 'special_pii'}}
 
-        text_for_digits = self._heal_ocr_digits(text)
+        run_ner = True
+        text_for_regex = text
 
+        if text.startswith('{"__is_table_data__":'):
+            try:
+                table_data = json.loads(text)
+                columns = table_data.get("columns", {})
+
+                fio_headers = ['фио', 'fio', 'имя', 'фамилия', 'отчество', 'сотрудник', 'клиент', 'name', 'full name']
+                flat_text_parts = []
+
+                for col_name, values in columns.items():
+                    col_lower = col_name.lower()
+                    if any(h in col_lower for h in fio_headers):
+                        for val in values:
+                            if len(val.split()) >= 2:
+                                findings['fio'].add(val.strip().title())
+                    else:
+                        flat_text_parts.extend(values)
+
+                text_for_regex = " ".join(flat_text_parts)
+                run_ner = False
+            except Exception:
+                pass
+
+        # === ИЗВЛЕЧЕНИЕ ФИО ===
+        if run_ner:
+            # Сжимаем переносы строк и делаем Title Case для SpaCy
+            title_text = re.sub(r'\s+', ' ', text_for_regex).title()
+            findings['fio'].update(self._extract_fios_spacy(title_text))
+
+        # Запускаем железобетонные эвристики на оригинальном тексте
+        findings['fio'].update(self._extract_fios_heuristics(text_for_regex))
+
+        text_for_digits = self._heal_ocr_digits(text_for_regex)
+
+        # === ПАСПОРТА (ХАК ПРОТИВ MRZ) ===
+        # 1. Спасаем MRZ-строки первыми
+        for match in re.findall(self.PATTERNS['passport_intl'], text_for_regex):
+            processed = self._process_match('passport_intl', match)
+            if processed: findings['passport'].add(processed)
+
+        # 2. Физически вырезаем MRZ из текста, чтобы регулярка паспорта РФ не сошла с ума
+        safe_text_for_regex = re.sub(r'[A-Z0-9<]{25,}', ' ', text_for_regex, flags=re.IGNORECASE)
+        safe_text_for_digits = re.sub(r'[A-Z0-9<]{25,}', ' ', text_for_digits, flags=re.IGNORECASE)
+
+        # === ОСТАЛЬНЫЕ РЕГУЛЯРКИ ===
         for key, pattern in self.PATTERNS.items():
-            target_text = text if key in ('email', 'driver_license', 'passport_intl') else text_for_digits
+            if key == 'passport_intl': continue  # Уже нашли
+
+            target_text = safe_text_for_regex if key in ('email', 'driver_license') else safe_text_for_digits
             for match in re.findall(pattern, target_text):
                 save_key = 'passport' if key.startswith('passport') else key
-                processed = self._process_match(save_key, match)
+                processed = self._process_match(key, match)
                 if processed:
                     findings[save_key].add(processed)
 
-        for match in ADDRESS_RE.findall(text):
+        for match in ADDRESS_RE.findall(safe_text_for_regex):
             findings['address'].add(re.sub(r'\s+', ' ', match).strip())
 
-        # 2. СОБИРАЕМ САМИ НАЙДЕННЫЕ СЛОВА-ТРИГГЕРЫ
-        for match in SPECIAL_PII_RE.findall(text):
+        for match in SPECIAL_PII_RE.findall(safe_text_for_regex):
             findings['special_pii'].add(match.strip().lower())
 
-        mrz_names = self._extract_names_from_mrz(text)
-        anchor_data = self._extract_foreign_pii_by_anchors(text)
+        # Дедупликация опечаток OCR и устранение коллизий
+        for key in ['passport', 'inn', 'snils', 'phone', 'bank_card']:
+            if findings[key]:
+                findings[key] = self._deduplicate_items(findings[key])
 
-        if mrz_names:
-            findings['fio'].update(mrz_names)
-        elif anchor_data['fio']:
-            findings['fio'].update(anchor_data['fio'])
-        else:
-            findings['fio'].update(self._extract_fios(text))
-
-        if anchor_data['passport']:
-            findings['passport'].update(anchor_data['passport'])
-
-        findings['passport'] = self._deduplicate_ids(findings['passport'])
-        findings['snils'] = self._deduplicate_ids(findings['snils'])
-        findings['inn'] = self._deduplicate_ids(findings['inn'])
-        findings['driver_license'] = self._deduplicate_ids(findings['driver_license'])
+        # 10-значный ИНН юрлица мог случайно попасть в паспорта. Убираем.
+        if findings['inn'] and findings['passport']:
+            findings['passport'] = findings['passport'] - findings['inn']
 
         counts = {k: len(v) for k, v in findings.items()}
         return {
             'stats': {
-                'common_pii': sum(counts[k] for k in ('fio', 'email', 'phone', 'address')),
-                'gov_ids': sum(counts[k] for k in ('passport', 'snils', 'inn', 'driver_license')),
-                'payment_info': sum(counts[k] for k in ('bank_card', 'bik', 'cvv')),
-
-                # 3. ТЕПЕРЬ ПРОСТО СЧИТАЕМ ДЛИНУ СОБРАННОГО МНОЖЕСТВА
+                'common_pii': counts['fio'] + counts['email'] + counts['phone'] + counts['address'],
+                'gov_ids': counts['passport'] + counts['snils'] + counts['inn'] + counts['driver_license'],
+                'payment_info': counts['bank_card'] + counts['bik'] + counts['cvv'],
                 'special_pii': counts['special_pii'],
             },
             'raw_data': {k: list(v) for k, v in findings.items()}
