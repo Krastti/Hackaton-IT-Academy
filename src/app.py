@@ -1,13 +1,14 @@
 import os
 import csv
 import json
+import logging
 from pathlib import Path
 from typing import Dict, Any, List, Set, Optional, cast
 from collections import defaultdict
 from datetime import datetime
 
 from tqdm import tqdm  # type: ignore
-from extractor import FileExtractor  # type: ignore
+from extractor import ExtractResult, FileExtractor  # type: ignore
 from analyzer import PIIAnalyzer  # type: ignore
 
 # Порог «большого объёма» по ТЗ: «десятки тысяч записей»
@@ -52,6 +53,9 @@ UZ_RECOMMENDATIONS: Dict[str, str] = {
 }
 
 
+logger = logging.getLogger(__name__)
+
+
 def _get_recommendation(uz: str) -> str:
     return UZ_RECOMMENDATIONS.get(uz, '')
 
@@ -65,6 +69,7 @@ class PIIController:
 
         # {путь: {stats, raw_data}}
         self.file_registry: Dict[str, Dict[str, Any]] = {}
+        self.extraction_registry: Dict[str, ExtractResult] = {}
         # {нормализованное_значение: {набор_путей}}
         self.anchor_index: Dict[str, Set[str]] = defaultdict(set)
 
@@ -124,10 +129,27 @@ class PIIController:
                 all_files.append(os.path.join(root, f))
 
         for f_path in tqdm(all_files, desc='Сканирование', unit='файл'):
-            text: str = str(self.extractor.extract_text(f_path))
+            extraction: ExtractResult = self.extractor.extract(f_path)
+            self.extraction_registry[f_path] = extraction
+
+            if extraction.status in ('failed', 'unsupported'):
+                logger.warning(
+                    'Не удалось извлечь текст из %s [%s]: %s',
+                    f_path,
+                    extraction.status,
+                    extraction.error or '; '.join(extraction.warnings),
+                )
+
+            text: str = str(extraction.text)
             if not text.strip():
                 continue
             res: Dict[str, Any] = self.analyzer.analyze_text(text)
+            res['extraction'] = {
+                'status': extraction.status,
+                'extractor': extraction.extractor,
+                'warnings': extraction.warnings,
+                'error': extraction.error,
+            }
             self.file_registry[f_path] = res
 
             raw_data: Dict[str, List[str]] = cast(
