@@ -189,27 +189,28 @@ class FileExtractor:
 
     @staticmethod
     def _extract_video(file_path: str) -> str:
-        """OCR ключевых кадров: 2 кадра в секунду на всё видео.
-
-        2 fps вместо 1 fps — чтобы не пропускать паспорт,
-        показанный коротко (1-2 секунды). Кадры предобрабатываются
-        (grayscale + выравнивание гистограммы) для лучшего OCR.
-        """
+        """OCR ключевых кадров: с логированием сырого текста."""
         reader = FileExtractor._get_reader()
         cap = cv2.VideoCapture(file_path)
         fps_raw: Any = cap.get(cv2.CAP_PROP_FPS)
         fps_val: float = float(fps_raw) if fps_raw and fps_raw > 0 else 24.0
 
-        # Анализируем всё видео, но не более 120 секунд
         total_frames: int = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         total_seconds: float = total_frames / fps_val
         max_seconds: float = min(total_seconds, 120.0)
 
-        # Шаг между кадрами: каждые 0.5 секунды (2 кадра в секунду)
-        step: float = fps_val / 2.0
+        # Шаг: 1 кадр каждые 2 секунды (ускорит дебаг и уменьшит дубли)
+        step: float = fps_val * 2.0
 
         text_blocks: List[str] = []
         frame_idx: int = 0
+
+        # --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
+        log_file_path = f"{file_path}_ocr_log.txt"
+        with open(log_file_path, 'w', encoding='utf-8') as log_file:
+            log_file.write(f"=== Лог OCR для видео: {file_path} ===\n")
+        print(f"\n[*] Дебаг: логи OCR для видео пишутся в файл {log_file_path}")
+        # -----------------------------
 
         while True:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -221,14 +222,31 @@ class FileExtractor:
             if current_sec > max_seconds:
                 break
 
-            # Предобработка: grayscale + выравнивание гистограммы
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.equalizeHist(gray)
-            frame_processed = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            frame_processed = FileExtractor._preprocess_for_ocr(frame)
+            frame_texts = []  # Собираем текст текущего кадра для лога
 
-            result: List[str] = reader.readtext(frame_processed, detail=0, paragraph=True)
-            if result:
-                text_blocks.append(' '.join(result))
+            # Горизонтальное чтение
+            result_h: List[str] = reader.readtext(frame_processed, detail=0, paragraph=True)
+            if result_h:
+                text_h = ' '.join(result_h)
+                text_blocks.append(text_h)
+                frame_texts.append(f"[Гориз]: {text_h}")
+
+            # Вертикальное чтение
+            frame_rotated = cv2.rotate(frame_processed, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            result_v: List[str] = reader.readtext(frame_rotated, detail=0, paragraph=True)
+            if result_v:
+                text_v = ' '.join(result_v)
+                text_blocks.append(text_v)
+                frame_texts.append(f"[Верт]: {text_v}")
+
+            # --- ЗАПИСЬ В ЛОГ И ВЫВОД В КОНСОЛЬ ---
+            if frame_texts:
+                log_message = f"[{current_sec:.1f} сек] " + " | ".join(frame_texts)
+                print(log_message)  # Вывод в терминал
+                with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                    log_file.write(log_message + '\n')
+            # --------------------------------------
 
             frame_idx = int(frame_idx + step)
 

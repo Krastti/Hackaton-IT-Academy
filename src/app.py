@@ -13,13 +13,13 @@ from analyzer import PIIAnalyzer  # type: ignore
 # Порог «большого объёма» по ТЗ: «десятки тысяч записей»
 LARGE_VOLUME_THRESHOLD: int = 1000
 
-# Человекочитаемые названия категорий
+# Человекочитаемые названия конкретных сущностей
 CATEGORY_LABELS: Dict[str, str] = {
     'fio':            'ФИО',
     'email':          'Email',
     'phone':          'Телефон',
     'address':        'Адрес',
-    'passport_rf':    'Паспорт РФ',
+    'passport':       'Паспорт', # ИСПРАВЛЕНО: было passport_rf
     'snils':          'СНИЛС',
     'inn':            'ИНН',
     'driver_license': 'Водительское удостоверение',
@@ -27,6 +27,14 @@ CATEGORY_LABELS: Dict[str, str] = {
     'bik':            'БИК',
     'cvv':            'CVV/CVC',
     'special_pii':    'Спецкатегории / Биометрия',
+}
+
+# ДОБАВЛЕНО: Человекочитаемые названия мета-категорий для отчета
+META_CATEGORY_LABELS: Dict[str, str] = {
+    'common_pii':     'Общие ПДн',
+    'gov_ids':        'Гос. идентификаторы',
+    'payment_info':   'Платёжные данные',
+    'special_pii':    'Спец. ПДн / Биометрия'
 }
 
 # Рекомендации по обработке в зависимости от УЗ
@@ -103,7 +111,8 @@ class PIIController:
                     raw_data: Dict[str, List[str]] = cast(
                         Dict[str, List[str]], node_data.get('raw_data', {})
                     )
-                    for category in ['email', 'phone', 'snils', 'inn', 'passport_rf']:
+                    # ИСПРАВЛЕНО: заменили passport_rf на passport
+                    for category in ['email', 'phone', 'snils', 'inn', 'passport']:
                         for value in raw_data.get(category, []):
                             for linked_file in self.anchor_index.get(value, set()):
                                 if linked_file not in visited:
@@ -133,7 +142,8 @@ class PIIController:
             raw_data: Dict[str, List[str]] = cast(
                 Dict[str, List[str]], res.get('raw_data', {})
             )
-            for cat in ['email', 'phone', 'snils', 'inn', 'passport_rf']:
+            # ИСПРАВЛЕНО: заменили passport_rf на passport
+            for cat in ['email', 'phone', 'snils', 'inn', 'passport']:
                 for val in raw_data.get(cat, []):
                     self.anchor_index[val].add(f_path)
 
@@ -143,12 +153,9 @@ class PIIController:
         print('[*] Шаг 2: Группировка файлов и классификация...')
         groups: List[Set[str]] = self._find_groups()
 
-        # Строим итоговые данные для всех трёх форматов
         report_rows: List[Dict[str, Any]] = []
 
         for group_id, group_files in enumerate(groups, start=1):
-            # Объединяем уникальные значения по каждой категории по всей группе.
-            # Один email/телефон в 2 файлах группы = 1 уникальный экземпляр.
             group_raw_union: Dict[str, Set[str]] = defaultdict(set)
             group_special_pii_total: int = 0
 
@@ -160,18 +167,16 @@ class PIIController:
                 for cat, items in raw_data.items():
                     group_raw_union[cat].update(items)
 
-                # special_pii — счётчик ключевых слов, не уникальных значений;
-                # суммируем из каждого файла отдельно
                 group_special_pii_total += int(f_stats.get('special_pii', 0))
 
-            # Пересобираем stats из дедуплицированных множеств
+            # ИСПРАВЛЕНО: используем ключ passport вместо passport_rf для подсчета госидентификаторов
             group_stats: Dict[str, int] = {
                 'common_pii': (
                     len(group_raw_union['fio']) + len(group_raw_union['email']) +
                     len(group_raw_union['phone']) + len(group_raw_union['address'])
                 ),
                 'gov_ids': (
-                    len(group_raw_union['passport_rf']) + len(group_raw_union['snils']) +
+                    len(group_raw_union['passport']) + len(group_raw_union['snils']) +
                     len(group_raw_union['inn']) + len(group_raw_union['driver_license'])
                 ),
                 'payment_info': (
@@ -194,9 +199,11 @@ class PIIController:
                 row: Dict[str, Any] = {
                     'path': f_path,
                     'group_id': f'Группа_{group_id}',
+                    # ИСПРАВЛЕНО: Переводим мета-категории (common_pii -> Общие ПДн) правильным словарем
                     'categories': [
-                        CATEGORY_LABELS.get(c, c) for c in sorted(group_categories)
+                        META_CATEGORY_LABELS.get(c, c) for c in sorted(group_categories)
                     ],
+                    # Здесь переводятся конкретные сущности (fio -> ФИО, passport -> Паспорт)
                     'counts': {
                         CATEGORY_LABELS.get(k, k): v
                         for k, v in group_counts.items() if v > 0
@@ -229,7 +236,7 @@ class PIIController:
                 'Количество_находок', 'УЗ', 'Формат', 'Рекомендации',
             ])
             for row in rows:
-                cats = ', '.join(row['categories'])
+                cats = ', '.join(row['categories']) if row['categories'] else '—'
                 counts = '; '.join(
                     f"{k}: {v}" for k, v in row['counts'].items()
                 )
@@ -254,7 +261,6 @@ class PIIController:
     ) -> None:
         path = self.output_prefix + '.md'
 
-        # Статистика по УЗ
         uz_counter: Dict[str, int] = defaultdict(int)
         for row in rows:
             uz_counter[row['uz']] += 1
@@ -300,5 +306,5 @@ class PIIController:
 
 
 if __name__ == '__main__':
-    app = PIIController('./test_dataset', 'report')
+    app = PIIController('../test_dataset', 'report')
     app.run_scan()
