@@ -1,28 +1,23 @@
 import re
-from typing import Dict, Set, List, Any, Optional, Iterable
+from typing import Dict, Set, List, Any, Optional
 import sys
+import pymorphy3  # type: ignore
 
-try:
-    import pymorphy3  # type: ignore
-except ImportError:  # pragma: no cover - зависит от окружения
-    pymorphy3 = None  # type: ignore
-else:
-    sys.modules["pymorphy2"] = pymorphy3
-    sys.modules["pymorphy2.analyzer"] = pymorphy3.analyzer
+sys.modules['pymorphy2'] = pymorphy3
+sys.modules['pymorphy2.analyzer'] = pymorphy3.analyzer
 
-try:
-    from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc  # type: ignore
-except ImportError:  # pragma: no cover - зависит от окружения
-    Segmenter = None  # type: ignore
-    MorphVocab = None  # type: ignore
-    NewsEmbedding = None  # type: ignore
-    NewsNERTagger = None  # type: ignore
-    Doc = None  # type: ignore
+from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc  # type: ignore
 
+
+# ---------------------------------------------------------------------------
+# Вспомогательные валидаторы
+import difflib
+# ---------------------------------------------------------------------------
 
 def is_luhn_valid(card_number: str) -> bool:
+    """Алгоритм Луна для банковских карт."""
     digits_list: List[int] = [int(d) for d in str(card_number) if d.isdigit()]
-    if not digits_list:
+    if len(digits_list) < 13:
         return False
     checksum: int = 0
     for i, digit in enumerate(reversed(digits_list)):
@@ -34,169 +29,261 @@ def is_luhn_valid(card_number: str) -> bool:
     return checksum % 10 == 0
 
 
+def is_snils_valid(snils_digits: str) -> bool:
+    """Проверка контрольной суммы СНИЛС (11 цифр без разделителей)."""
+    if len(snils_digits) != 11 or not snils_digits.isdigit():
+        return False
+    number = snils_digits[:9]
+    control = int(snils_digits[9:11])
+    # Номера до 001-001-998 — специальные, контрольная сумма не проверяется
+    if int(number) <= 1001998:
+        return True
+    checksum: int = 0
+    for i, d in enumerate(number):
+        checksum += int(d) * (9 - i)
+    if checksum > 101:
+        checksum %= 101
+    if checksum in (100, 101):
+        checksum = 0
+    return checksum == control
+
+
 def normalize_phone(phone_str: str) -> str:
-    digits: str = str(re.sub(r"\D", "", phone_str))
-    if len(digits) == 11 and digits.startswith("8"):
-        return "7" + digits.replace("8", "", 1)
-    if len(digits) == 10:
-        return "7" + digits
+    digits: str = re.sub(r'\D', '', phone_str)
+    if len(digits) == 11 and digits.startswith('8'):
+        return '7' + digits[1:]
+    elif len(digits) == 10:
+        return '7' + digits
     return digits
 
 
 def normalize_gov_id(id_str: str) -> str:
-    return str(re.sub(r"\D", "", id_str))
+    return re.sub(r'\D', '', id_str)
 
 
-def is_valid_inn(inn: str) -> bool:
-    digits: str = normalize_gov_id(inn)
+# ---------------------------------------------------------------------------
+# Детектор специальных категорий ПДн и биометрии (152-ФЗ ст. 10 и ст. 11)
+# ---------------------------------------------------------------------------
 
-    if len(digits) == 10:
-        coeffs = [2, 4, 10, 3, 5, 9, 4, 6, 8]
-        checksum = sum(int(d) * c for d, c in zip(digits[:9], coeffs)) % 11 % 10
-        return checksum == int(digits[9])
+_SPECIAL_KW: List[str] = [
+    # Состояние здоровья / медицина
+    r'диагноз', r'диабет', r'онкол\w+', r'\bвич\b', r'\bспид\b',
+    r'инвалид\w+', r'группа\s+крови', r'анализ\s+крови',
+    r'мкб[-\s]?\d+', r'история\s+болезни', r'медицинск\w+\s+карт\w+',
+    r'рецепт\b', r'лечени\w+', r'госпитализац\w+', r'хирург\w+',
+    r'операци\w+', r'психиатр\w+', r'нарколог\w+', r'иммунодефицит',
+    # Биометрия
+    r'отпеч\w+\s+пальц', r'радужн\w+\s+оболочк', r'сетчатк\w+',
+    r'голосовой\s+образец', r'биометр\w+', r'дактилоскоп\w+',
+    r'распознавание\s+лиц', r'face[\s_-]*id', r'fingerprint',
+    # Религия и политические убеждения
+    r'религи\w+', r'вероисповедан\w+', r'конфесси\w+', r'православ\w+',
+    r'мусульман\w+', r'католи\w+', r'атеист\w+', r'буддист\w+',
+    r'политическ\w+\s+(?:взгляд|убежден|позиц)\w+',
+    # Национальность и раса
+    r'национальност\w+', r'расов\w+', r'этническ\w+',
+]
 
-    if len(digits) == 12:
-        coeffs_11 = [7, 2, 4, 10, 3, 5, 9, 4, 6, 8]
-        coeffs_12 = [3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]
-        checksum_11 = sum(int(d) * c for d, c in zip(digits[:10], coeffs_11)) % 11 % 10
-        checksum_12 = sum(int(d) * c for d, c in zip(digits[:11], coeffs_12)) % 11 % 10
-        return checksum_11 == int(digits[10]) and checksum_12 == int(digits[11])
+SPECIAL_PII_RE: re.Pattern = re.compile(
+    '|'.join(_SPECIAL_KW), re.IGNORECASE
+)
 
-    return False
+# ---------------------------------------------------------------------------
+# Паттерн адресов
+# ---------------------------------------------------------------------------
 
-
-def is_valid_snils(snils: str) -> bool:
-    digits: str = normalize_gov_id(snils)
-    if len(digits) != 11:
-        return False
-
-    total = sum(int(digit) * weight for digit, weight in zip(digits[:9], range(9, 0, -1)))
-    if total < 100:
-        checksum = total
-    elif total in (100, 101):
-        checksum = 0
-    else:
-        checksum = total % 101
-        if checksum == 100:
-            checksum = 0
-
-    return checksum == int(digits[9:])
+ADDRESS_RE: re.Pattern = re.compile(
+    r'(?:'
+    r'г\.|город|ул\.|улица|пр-?т\.?|проспект|пер\.|переулок'
+    r'|б-?р\.?|бульвар|пл\.|площадь|шоссе|набережная'
+    r')'
+    r'[\s\w\-«»"\'.]+?'
+    r'(?:д\.|дом)\s*\d+\w*',
+    re.IGNORECASE
+)
 
 
 def clean_ocr_text_for_ner(raw_text: str) -> str:
-    """Очищает мусорный текст после OCR и готовит его для Наташи."""
-    text = re.sub(r"[~|`^_\\]", " ", raw_text)
-    text = re.sub(r"\s+", " ", text).strip()
+    """Очищает текст ТОЛЬКО для NER (Natasha). НЕ применять к тексту перед regex."""
+    text = re.sub(r'[~|`^_\\]', ' ', raw_text)
+    text = re.sub(r'[a-zA-Z]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
     words = text.split()
+    # Title Case для каждого слова — Natasha ищет имена с заглавной
     normalized_words = [
-        word.capitalize() if word.isupper() else word
+        word.capitalize()  # работает и на ALL_CAPS, и на строчных
         for word in words
     ]
     return " ".join(normalized_words)
 
 
+# ---------------------------------------------------------------------------
+# Основной анализатор
+# ---------------------------------------------------------------------------
+
 class PIIAnalyzer:
     def __init__(self) -> None:
-        self.segmenter = Segmenter() if Segmenter is not None else None
-        self.morph_vocab = MorphVocab() if MorphVocab is not None else None
-        self.emb = NewsEmbedding() if NewsEmbedding is not None else None
-        self.ner_tagger = NewsNERTagger(self.emb) if NewsNERTagger is not None and self.emb is not None else None
+        self.segmenter = Segmenter()
+        self.morph_vocab = MorphVocab()
+        self.emb = NewsEmbedding()
+        self.ner_tagger = NewsNERTagger(self.emb)
 
         self.patterns: Dict[str, str] = {
-            "passport_rf": r"\b\d{2}\s?\d{2}\s?\d{6}\b|\b\d{4}\s?\d{6}\b",
-            "snils": r"\b\d{3}[-\s]?\d{3}[-\s]?\d{3}[-\s]?\d{2}\b",
-            "inn": r"\b\d{10}\b|\b\d{12}\b",
-            "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,7}\b",
-            "phone": r"\b(?:\+7|8)[-\s]?\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{2}[-\s]?\d{2}\b",
-            "bank_card": r"\b(?:\d{4}[-\s]?){3}\d{4}\b",
+            # Паспорт РФ: серия (4 цифры) + номер (6 цифр)
+            # Варианты из OCR:
+            #  1) С ключевым словом «паспорт/серия» + цифры
+            #  2) Обычный формат «XX XX XXXXXX» / «XX-XX-XXXXXX» / «XXXX XXXXXX»
+            #  3) MRZ (ICAO TD3): зона машинного чтения — цифры+RUS+цифры, 
+            #     напр.: 4528336887RU80803119<<<<<< или 887RU80803119
+            'passport_rf': (
+                r'(?i)(?:паспорт(?:ные\s+данные)?|серия(?:\s+и\s+номер)?)[:\s#№]*'
+                r'\d{2}\s?\d{2}[\s\-]?\d{6}'
+                r'|\b\d{2}[\s\-]?\d{2}[\s\-]\d{6}\b'        # XX XX XXXXXX / XX-XX-XXXXXX
+                r'|\b\d{4}[\s\-]\d{6}\b'                    # XXXX XXXXXX
+                r'|\b\d{9,10}(?:RU|RUS)\d{7,9}[<A-Z0-9]*'  # MRZ: NNNNNNNNNRUSDDDDDDDD<<
+                r'|\d{3,4}(?:RU|RUS)\d{7,9}[<A-Z0-9]'      # MRZ обрезанный: 887RU80803119
+            ),
+            # СНИЛС: 11 цифр с возможными разделителями — XXX-XXX-XXX XX
+            'snils': r'\b\d{3}[-\s]?\d{3}[-\s]?\d{3}[-\s]\d{2}\b',
+            # ИНН: 10 цифр — только с контекстом; 12 цифр — без контекста
+            'inn': (
+                r'(?i)(?:инн)[:\s#№]*[\d]{10,12}'
+                r'|\b\d{12}\b'
+            ),
+            'email': r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,7}\b',
+            'phone': r'\b(?:\+7|8)[-\s]?\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{2}[-\s]?\d{2}\b',
+            'bank_card': r'\b(?:\d{4}[-\s]?){3}\d{4}\b',
+            # Водительское удостоверение РФ: 2 цифры + 2 буквы (рус/лат) + 6 цифр
+            'driver_license': r'\b\d{2}[\s]?[А-ЯA-Z]{2}[\s]?\d{6}\b',
+            # БИК: 9 цифр, начинается с 04, с контекстом
+            'bik': r'(?i)(?:бик|BIK)[:\s]*\b04\d{7}\b',
+            # CVV/CVC: 3-4 цифры с контекстом
+            'cvv': r'(?i)(?:cvv2?|cvc2?|csc)[:\s]*\b\d{3,4}\b',
         }
-        self.passport_context_pattern = re.compile(
-            r"(паспорт|серия|номер|код подразделения)",
-            flags=re.IGNORECASE,
-        )
-        self.passport_document_pattern = re.compile(
-            r"(паспорт|код подразделения|выдан|дата рождения|место рождения)",
-            flags=re.IGNORECASE,
-        )
-
-    def _iter_passport_matches(self, text: str) -> Iterable[str]:
-        document_looks_like_passport = bool(self.passport_document_pattern.search(text))
-        for match in re.finditer(self.patterns["passport_rf"], text):
-            candidate = match.group(0)
-            context_start = max(0, match.start() - 160)
-            context_end = min(len(text), match.end() + 160)
-            context = text[context_start:context_end]
-            if self.passport_context_pattern.search(context) or document_looks_like_passport:
-                yield candidate
 
     def analyze_text(self, text: str) -> Dict[str, Any]:
         findings: Dict[str, Set[str]] = {
-            "fio": set(),
-            "email": set(),
-            "phone": set(),
-            "passport_rf": set(),
-            "snils": set(),
-            "inn": set(),
-            "bank_card": set(),
+            'fio': set(),
+            'email': set(),
+            'phone': set(),
+            'passport_rf': set(),
+            'snils': set(),
+            'inn': set(),
+            'bank_card': set(),
+            'driver_license': set(),
+            'bik': set(),
+            'cvv': set(),
+            'address': set(),
         }
 
-        for match in re.findall(self.patterns["email"], text):
-            email_set: Optional[Set[str]] = findings.get("email")
-            if email_set is not None:
-                email_set.add(match.lower())
+        # --- 1. Regex-поиск на оригинальном тексте (латиница не удаляется) ---
+        for key in ['email', 'bank_card', 'driver_license']:
+            for match in re.findall(self.patterns[key], text):
+                t = findings.get(key)
+                if t is None:
+                    continue
+                if key == 'bank_card':
+                    if is_luhn_valid(match):
+                        t.add(normalize_gov_id(match))
+                else:
+                    t.add(match.strip())
 
-        for match in self._iter_passport_matches(text):
-            passport_set: Optional[Set[str]] = findings.get("passport_rf")
-            if passport_set is not None:
-                passport_set.add(normalize_gov_id(match))
+        for key in ['passport_rf', 'snils', 'inn']:
+            for match in re.findall(self.patterns[key], text):
+                t = findings.get(key)
+                if t is None:
+                    continue
+                normalized = normalize_gov_id(match)
+                if key == 'snils':
+                    if is_snils_valid(normalized):
+                        t.add(normalized)
+                else:
+                    t.add(normalized)
 
-        for match in re.findall(self.patterns["snils"], text):
-            snils_set: Optional[Set[str]] = findings.get("snils")
-            if snils_set is not None and is_valid_snils(match):
-                snils_set.add(normalize_gov_id(match))
+        for p in re.findall(self.patterns['phone'], text):
+            s = findings.get('phone')
+            if s is not None:
+                s.add(normalize_phone(p))
 
-        for match in re.findall(self.patterns["inn"], text):
-            inn_set: Optional[Set[str]] = findings.get("inn")
-            if inn_set is not None and is_valid_inn(match):
-                inn_set.add(normalize_gov_id(match))
+        for key in ['bik', 'cvv']:
+            for match in re.findall(self.patterns[key], text):
+                t = findings.get(key)
+                if t is not None:
+                    digits_only = re.sub(r'\D', '', match)
+                    if digits_only:
+                        t.add(digits_only)
 
-        for match in re.findall(self.patterns["bank_card"], text):
-            card_set: Optional[Set[str]] = findings.get("bank_card")
-            if card_set is not None and is_luhn_valid(match):
-                card_set.add(normalize_gov_id(match))
+        for match in ADDRESS_RE.findall(text):
+            addr_set = findings.get('address')
+            if addr_set is not None:
+                addr_set.add(re.sub(r'\s+', ' ', match).strip())
 
-        phone_matches: List[str] = re.findall(self.patterns["phone"], text)
-        for phone_match in phone_matches:
-            phone_set: Optional[Set[str]] = findings.get("phone")
-            if phone_set is not None:
-                phone_set.add(normalize_phone(phone_match))
+        # --- 2. Специальные категории ПДн (ключевые слова) ---
+        special_matches: List[str] = SPECIAL_PII_RE.findall(text)
+        special_count: int = len(special_matches)
 
-        if all(component is not None for component in (self.segmenter, self.morph_vocab, self.ner_tagger, Doc)):
-            clean_text_for_natasha = clean_ocr_text_for_ner(text)
-            doc = Doc(clean_text_for_natasha)
-            doc.segment(self.segmenter)
-            doc.tag_ner(self.ner_tagger)
+        # Словарь для дедупликации ФИО по первым символам фамилии
+        fio_by_surname: Dict[str, str] = {}
 
-            for span in doc.spans:
-                if span.type == "PER":
-                    span.normalize(self.morph_vocab)
-                    if span.normal and " " in span.normal:
-                        fio_set: Optional[Set[str]] = findings.get("fio")
-                        if fio_set is not None:
-                            fio_set.add(span.normal)
+        clean_text_for_ner = clean_ocr_text_for_ner(text)
+        doc = Doc(clean_text_for_ner)
+        doc.segment(self.segmenter)
+        doc.tag_ner(self.ner_tagger)
+
+        # Дедупликация ФИО по фамилии: одно и то же имя может быть найдено
+        # в разных кадрах видео в разных падежах → разные строки в set.
+        # Группируем по первому слову (фамилии), оставляем самую длинную форму.
+        for span in doc.spans:
+            if span.type == 'PER':
+                span.normalize(self.morph_vocab)
+                if span.normal:
+                    words = span.normal.split()
+                    # Берём максимум первые 3 слова (Фамилия Имя Отчество)
+                    # Natasha иногда захватывает лишние слова после имени
+                    fio_words = words[:3]
+                    # Каждое слово ≥ 4 символа (отсекает OCR-мусор «Муж», «Гор»)
+                    if len(fio_words) >= 2 and all(len(w) >= 4 for w in fio_words):
+                        name_str = ' '.join(fio_words)
+                        surname_key = fio_words[0].lower()
+                        existing = fio_by_surname.get(surname_key, '')
+                        if len(name_str) > len(existing):
+                            fio_by_surname[surname_key] = name_str
+
+        fio_set_final: Optional[Set[str]] = findings.get('fio')
+        if fio_set_final is not None:
+            final_fio_list = []
+            for name in fio_by_surname.values():
+                is_similar = False
+                for i, ext_name in enumerate(final_fio_list):
+                    if difflib.SequenceMatcher(None, name.lower(), ext_name.lower()).ratio() > 0.6:
+                        if len(name) > len(ext_name):
+                            final_fio_list[i] = name
+                        is_similar = True
+                        break
+                if not is_similar:
+                    final_fio_list.append(name)
+            fio_set_final.update(final_fio_list)
 
         serialized_findings: Dict[str, List[str]] = {
-            key: sorted(values) for key, values in findings.items()
+            k: list(v) for k, v in findings.items()
         }
 
         stats: Dict[str, int] = {
-            "common_pii": len(findings["fio"]) + len(findings["email"]) + len(findings["phone"]),
-            "gov_ids": len(findings["passport_rf"]) + len(findings["snils"]) + len(findings["inn"]),
-            "payment_info": len(findings["bank_card"]),
-            "special_pii": 0,
+            'common_pii': (
+                len(findings['fio']) + len(findings['email']) +
+                len(findings['phone']) + len(findings['address'])
+            ),
+            'gov_ids': (
+                len(findings['passport_rf']) + len(findings['snils']) +
+                len(findings['inn']) + len(findings['driver_license'])
+            ),
+            'payment_info': (
+                len(findings['bank_card']) + len(findings['bik']) + len(findings['cvv'])
+            ),
+            'special_pii': special_count,
         }
 
         return {
-            "stats": stats,
-            "raw_data": serialized_findings,
+            'stats': stats,
+            'raw_data': serialized_findings,
         }

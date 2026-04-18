@@ -1,275 +1,236 @@
 import os
 import json
-import csv
-import io
-import warnings
-from dataclasses import dataclass
-from typing import List, Any, Iterator, Optional, Set
+import cv2  # type: ignore
+import easyocr  # type: ignore
+import pandas as pd  # type: ignore
+import fitz  # PyMuPDF  # type: ignore
+import docx  # type: ignore
+import docx2txt  # type: ignore
+from bs4 import BeautifulSoup  # type: ignore
+from striprtf.striprtf import rtf_to_text  # type: ignore
+from typing import List, Any, Dict, Optional, Iterator
 import itertools
-import zipfile
-import xml.etree.ElementTree as ET
-from contextlib import redirect_stderr, redirect_stdout
-
-try:
-    import cv2  # type: ignore
-except ImportError:  # pragma: no cover - зависит от окружения
-    cv2 = None  # type: ignore
-
-try:
-    import easyocr  # type: ignore
-except ImportError:  # pragma: no cover - зависит от окружения
-    easyocr = None  # type: ignore
-
-try:
-    import pandas as pd  # type: ignore
-except ImportError:  # pragma: no cover - зависит от окружения
-    pd = None  # type: ignore
-
-try:
-    import fitz  # PyMuPDF
-except ImportError:  # pragma: no cover - зависит от окружения
-    fitz = None  # type: ignore
-
-try:
-    import docx  # type: ignore
-except ImportError:  # pragma: no cover - зависит от окружения
-    docx = None  # type: ignore
-
-try:
-    from bs4 import BeautifulSoup
-except ImportError:  # pragma: no cover - зависит от окружения
-    BeautifulSoup = None  # type: ignore
-
-try:
-    from striprtf.striprtf import rtf_to_text  # type: ignore
-except ImportError:  # pragma: no cover - зависит от окружения
-    rtf_to_text = None  # type: ignore
-
-
-@dataclass
-class ExtractionResult:
-    text: str
-    status: str
-    error: Optional[str] = None
 
 
 class FileExtractor:
 
-    _reader: Any = None
-
-    @staticmethod
-    def _run_quietly(func: Any) -> Any:
-        """Подавляет служебный шум OCR-библиотек в консоли."""
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r".*pin_memory.*no accelerator is found.*",
-                category=UserWarning,
-            )
-            sink = io.StringIO()
-            with redirect_stdout(sink), redirect_stderr(sink):
-                return func()
+    _reader: Optional[easyocr.Reader] = None
 
     @classmethod
-    def _get_reader(cls) -> Any:
-        if easyocr is None:
-            raise RuntimeError("easyocr is not installed")
+    def _get_reader(cls) -> easyocr.Reader:
         if cls._reader is None:
-            cls._reader = cls._run_quietly(
-                lambda: easyocr.Reader(["ru", "en"], gpu=False, verbose=False)
-            )
+            cls._reader = easyocr.Reader(['ru', 'en'], gpu=False)
         return cls._reader
 
     @staticmethod
-    def extract_text(file_path: str) -> ExtractionResult:
+    def extract_text(file_path: str) -> str:
         ext: str = os.path.splitext(file_path)[1].lower()
 
         try:
-            if ext == ".pdf":
-                if fitz is None:
-                    return ExtractionResult("", "unsupported", "PyMuPDF is not installed")
-                return ExtractionResult(FileExtractor._extract_pdf(file_path), "ok")
-            if ext == ".docx":
-                return ExtractionResult(FileExtractor._extract_docx(file_path), "ok")
-            if ext == ".doc":
-                return ExtractionResult("", "unsupported", "Legacy .doc is not supported")
-            if ext in [".csv", ".parquet", ".xls", ".xlsx"]:
-                if ext == ".parquet" and pd is None:
-                    return ExtractionResult("", "unsupported", "pandas is required for .parquet")
-                if ext in [".xls", ".xlsx"] and pd is None:
-                    return ExtractionResult("", "unsupported", "pandas is required for Excel formats")
-                return ExtractionResult(FileExtractor._extract_table(file_path, ext), "ok")
-            if ext == ".json":
-                return ExtractionResult(FileExtractor._extract_json(file_path), "ok")
-            if ext == ".rtf":
-                if rtf_to_text is None:
-                    return ExtractionResult("", "unsupported", "striprtf is not installed")
-                return ExtractionResult(FileExtractor._extract_rtf(file_path), "ok")
-            if ext == ".html":
-                if BeautifulSoup is None:
-                    return ExtractionResult("", "unsupported", "beautifulsoup4 is not installed")
-                return ExtractionResult(FileExtractor._extract_html(file_path), "ok")
-            if ext in [".png", ".jpg", ".jpeg", ".tif", ".gif"]:
-                if cv2 is None or easyocr is None:
-                    return ExtractionResult("", "unsupported", "OCR dependencies are not installed")
-                return ExtractionResult(FileExtractor._extract_image(file_path), "ok")
-            if ext in [".mp4", ".avi", ".mov", ".mkv"]:
-                if cv2 is None or easyocr is None:
-                    return ExtractionResult("", "unsupported", "OCR dependencies are not installed")
-                return ExtractionResult(FileExtractor._extract_video(file_path), "ok")
-            if ext in [".txt", ".md"]:
-                return ExtractionResult(FileExtractor._extract_plain_text(file_path), "ok")
-            return ExtractionResult("", "unsupported", f"Unsupported extension: {ext or '<none>'}")
-        except Exception as exc:
-            return ExtractionResult("", "error", str(exc))
+            if ext == '.pdf':
+                return FileExtractor._extract_pdf(file_path)
+            elif ext == '.docx':
+                return FileExtractor._extract_docx(file_path)
+            elif ext == '.doc':
+                return FileExtractor._extract_doc(file_path)
+            elif ext in ('.csv', '.parquet', '.xls', '.xlsx'):
+                return FileExtractor._extract_table(file_path, ext)
+            elif ext == '.json':
+                return FileExtractor._extract_json(file_path)
+            elif ext == '.rtf':
+                return FileExtractor._extract_rtf(file_path)
+            elif ext == '.html':
+                return FileExtractor._extract_html(file_path)
+            elif ext in ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.gif'):
+                return FileExtractor._extract_image(file_path)
+            elif ext in ('.mp4', '.avi', '.mov', '.mkv'):
+                return FileExtractor._extract_video(file_path)
+            elif ext in ('.txt', '.md', '.log'):
+                return FileExtractor._extract_plain_text(file_path)
+            else:
+                return ''
+        except Exception as e:
+            print(f'[!] Ошибка при обработке {os.path.basename(file_path)}: {e}')
+            return ''
+
+    # ------------------------------------------------------------------
+    # Документы
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _extract_pdf(file_path: str) -> str:
-        if fitz is None:
-            raise RuntimeError("PyMuPDF is not installed")
         text_blocks: List[str] = []
         with fitz.open(file_path) as doc:
             for page in doc:
                 text_blocks.append(page.get_text())
-        return " ".join(text_blocks)
+        return ' '.join(text_blocks)
 
     @staticmethod
     def _extract_docx(file_path: str) -> str:
-        if docx is not None:
-            doc = docx.Document(file_path)
-            return " ".join([p.text for p in doc.paragraphs])
+        doc = docx.Document(file_path)
+        # Параграфы + ячейки таблиц
+        parts: List[str] = [p.text for p in doc.paragraphs]
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    parts.append(cell.text)
+        return ' '.join(parts)
 
-        with zipfile.ZipFile(file_path) as archive:
-            xml_bytes = archive.read("word/document.xml")
-        root = ET.fromstring(xml_bytes)
-        namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-        paragraphs: List[str] = []
-        for paragraph in root.findall(".//w:p", namespace):
-            text_parts = [node.text or "" for node in paragraph.findall(".//w:t", namespace)]
-            paragraph_text = "".join(text_parts).strip()
-            if paragraph_text:
-                paragraphs.append(paragraph_text)
-        return " ".join(paragraphs)
+    @staticmethod
+    def _extract_doc(file_path: str) -> str:
+        """Извлечение текста из .doc через docx2txt (не требует LibreOffice)."""
+        try:
+            return docx2txt.process(file_path) or ''
+        except Exception as e:
+            print(f'[!] docx2txt не смог открыть {os.path.basename(file_path)}: {e}')
+            return ''
 
     @staticmethod
     def _extract_rtf(file_path: str) -> str:
-        if rtf_to_text is None:
-            raise RuntimeError("striprtf is not installed")
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as file_obj:
-            return str(rtf_to_text(file_obj.read()))
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            return str(rtf_to_text(f.read()))
+
+    # ------------------------------------------------------------------
+    # Структурированные данные
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _extract_table(file_path: str, ext: str) -> str:
-        if ext == ".csv":
-            if pd is not None:
-                df = pd.read_csv(file_path, on_bad_lines="skip", encoding="utf-8")
-                return str(df.to_string(index=False))
-            return FileExtractor._extract_csv_fallback(file_path)
-        if pd is None:
-            raise RuntimeError("pandas is not installed")
-        if ext == ".parquet":
-            df = pd.read_parquet(file_path)
-        else:
-            df = pd.read_excel(file_path)
-        return str(df.to_string(index=False))
-
-    @staticmethod
-    def _extract_csv_fallback(file_path: str) -> str:
-        encodings = ["utf-8", "utf-8-sig", "cp1251", "latin-1"]
-        last_error: Optional[Exception] = None
-
-        for encoding in encodings:
-            try:
-                with open(file_path, "r", encoding=encoding, errors="strict", newline="") as file_obj:
-                    sample = file_obj.read(2048)
-                    file_obj.seek(0)
-                    dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
-                    reader = csv.reader(file_obj, dialect)
-                    rows = [" ".join(cell.strip() for cell in row if cell.strip()) for row in reader]
-                    return " ".join(row for row in rows if row)
-            except Exception as exc:
-                last_error = exc
-
-        raise RuntimeError(f"Unable to read CSV file: {last_error}")
+        """Чтение таблиц с последовательным перебором кодировок для CSV."""
+        ENCODINGS: List[str] = ['utf-8-sig', 'utf-8', 'cp1251', 'latin-1']
+        try:
+            if ext == '.csv':
+                df: Optional[Any] = None
+                for enc in ENCODINGS:
+                    try:
+                        df = pd.read_csv(
+                            file_path,
+                            on_bad_lines='skip',
+                            encoding=enc,
+                            low_memory=False,
+                        )
+                        break  # успешно прочитали
+                    except (UnicodeDecodeError, Exception):
+                        continue
+                if df is None:
+                    return ''
+            elif ext == '.parquet':
+                df = pd.read_parquet(file_path)
+            else:
+                df = pd.read_excel(file_path)
+            return str(df.to_string(index=False))
+        except Exception:
+            return ''
 
     @staticmethod
     def _extract_json(file_path: str) -> str:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as file_obj:
-            data = json.load(file_obj)
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            data = json.load(f)
         return json.dumps(data, ensure_ascii=False)
 
     @staticmethod
     def _extract_html(file_path: str) -> str:
-        if BeautifulSoup is None:
-            raise RuntimeError("beautifulsoup4 is not installed")
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as file_obj:
-            soup = BeautifulSoup(file_obj.read(), "html.parser")
-            return soup.get_text(separator=" ", strip=True)
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            soup = BeautifulSoup(f.read(), 'html.parser')
+            return soup.get_text(separator=' ', strip=True)
+
+    @staticmethod
+    def _extract_plain_text(file_path: str) -> str:
+        for enc in ('utf-8-sig', 'utf-8', 'cp1251', 'latin-1'):
+            try:
+                with open(file_path, 'r', encoding=enc) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+        return ''
+
+    # ------------------------------------------------------------------
+    # Медиафайлы (OCR)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _preprocess_for_ocr(img: Any) -> Any:
+        """ЧБ + адаптивный порог для улучшения распознавания документов.
+
+        Адаптивный порог лучше equalizeHist для неравномерного освещения
+        (документы с тенями, блики, тёмные края).
+        """
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        processed = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=31, C=10
+        )
+        return cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
 
     @staticmethod
     def _extract_image(file_path: str) -> str:
-        """Двойной проход EasyOCR с дедупликацией фрагментов."""
-        if cv2 is None:
-            raise RuntimeError("opencv-python is not installed")
+        """Двойной проход EasyOCR: горизонталь + поворот на 90°.
+
+        Каждый кадр предобрабатывается в ЧБ с адаптивным порогом
+        для лучшего распознавания текста на документах.
+        """
         reader = FileExtractor._get_reader()
         img = cv2.imread(file_path)
 
         if img is None:
-            return ""
+            return ''
 
-        fragments: List[str] = []
-        seen: Set[str] = set()
-        candidates = [img, cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)]
+        img_proc = FileExtractor._preprocess_for_ocr(img)
+        res_h: List[str] = reader.readtext(img_proc, detail=0, paragraph=True)
+        text_horizontal: str = ' '.join(res_h)
 
-        for candidate in candidates:
-            result = FileExtractor._run_quietly(
-                lambda: reader.readtext(candidate, detail=0, paragraph=True)
-            )
-            for chunk in result:
-                normalized = " ".join(chunk.split())
-                if normalized and normalized not in seen:
-                    seen.add(normalized)
-                    fragments.append(normalized)
+        img_rotated = cv2.rotate(img_proc, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        res_v: List[str] = reader.readtext(img_rotated, detail=0, paragraph=True)
+        text_vertical: str = ' '.join(res_v)
 
-        return " ".join(fragments)
+        return text_horizontal + ' ' + text_vertical
 
     @staticmethod
     def _extract_video(file_path: str) -> str:
-        if cv2 is None:
-            raise RuntimeError("opencv-python is not installed")
+        """OCR ключевых кадров: 2 кадра в секунду на всё видео.
+
+        2 fps вместо 1 fps — чтобы не пропускать паспорт,
+        показанный коротко (1-2 секунды). Кадры предобрабатываются
+        (grayscale + выравнивание гистограммы) для лучшего OCR.
+        """
         reader = FileExtractor._get_reader()
         cap = cv2.VideoCapture(file_path)
         fps_raw: Any = cap.get(cv2.CAP_PROP_FPS)
-        fps_val: int = int(fps_raw) if fps_raw and int(fps_raw) > 0 else 24
+        fps_val: float = float(fps_raw) if fps_raw and fps_raw > 0 else 24.0
+
+        # Анализируем всё видео, но не более 120 секунд
+        total_frames: int = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_seconds: float = total_frames / fps_val
+        max_seconds: float = min(total_seconds, 120.0)
+
+        # Шаг между кадрами: каждые 0.5 секунды (2 кадра в секунду)
+        step: float = fps_val / 2.0
 
         text_blocks: List[str] = []
-        max_seconds: int = 10
-        counter: Iterator[int] = itertools.count()
+        frame_idx: int = 0
 
-        while cap.isOpened():
+        while True:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if not ret:
                 break
 
-            frame_idx: int = next(counter)
-            sec_info = divmod(frame_idx, fps_val)
-            current_sec: int = int(sec_info[0])
-            remainder: int = int(sec_info[1])
+            current_sec: float = frame_idx / fps_val
+            if current_sec > max_seconds:
+                break
 
-            if remainder == 0:
-                if current_sec >= max_seconds:
-                    break
+            # Предобработка: grayscale + выравнивание гистограммы
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.equalizeHist(gray)
+            frame_processed = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-                result = FileExtractor._run_quietly(
-                    lambda: reader.readtext(frame, detail=0)
-                )
-                if result:
-                    text_blocks.append(" ".join(result))
+            result: List[str] = reader.readtext(frame_processed, detail=0, paragraph=True)
+            if result:
+                text_blocks.append(' '.join(result))
+
+            frame_idx = int(frame_idx + step)
 
         cap.release()
-        return " ".join(text_blocks)
-
-    @staticmethod
-    def _extract_plain_text(file_path: str) -> str:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as file_obj:
-            return file_obj.read()
+        return ' '.join(text_blocks)
