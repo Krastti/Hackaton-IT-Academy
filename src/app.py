@@ -132,10 +132,16 @@ class PIIController:
             for f in files:
                 all_files.append(os.path.join(root, f))
 
-        for f_path in tqdm(all_files, desc='Сканирование', unit='файл'):
-            text: str = str(self.extractor.extract_text(f_path))
-            if not text.strip():
-                continue
+                # Создаем объект прогресс-бара отдельно
+            pbar = tqdm(all_files, desc='Сканирование', unit='файл')
+
+            for f_path in pbar:
+                    # Добавляем имя текущего файла (без полного пути) справа от прогресс-бара
+                pbar.set_postfix_str(f"Файл: {os.path.basename(f_path)}")
+
+                text: str = str(self.extractor.extract_text(f_path))
+                #if not text.strip():
+                #    continue
             res: Dict[str, Any] = self.analyzer.analyze_text(text)
             self.file_registry[f_path] = res
 

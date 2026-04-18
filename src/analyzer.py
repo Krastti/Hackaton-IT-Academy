@@ -77,20 +77,20 @@ ADDRESS_RE = re.compile(
 class PIIAnalyzer:
     PATTERNS = {
         # Переименовали в passport, так как теперь ловим любые страны
-        'passport': (
-            r'(?i)'
-            r'(?:'
-            # 1. СНГ формат с префиксом. Разрешаем буквы, так как OCR часто путает цифры с буквами
+        'passport_rf': (
+            r'(?i)(?:'
+            # 1. СНГ/РФ формат с префиксом (ищем строго по вылеченным цифрам)
             r'(?:п[аaоo0]сп[оoаa0]рт(?:ные\s+данные)?|серия(?:\s+и\s+номер)?)[:\s#№]*'
-            r'[A-ZА-Я0-9]{2}[\s\-\.,_]*[A-ZА-Я0-9]{2}[\s\-\.,_]*[A-ZА-Я0-9]{6}'
+            r'\d{2}[\s\-\.,_]*\d{2}[\s\-\.,_]*\d{6}'
             r'|'
-            # 2. РФ формат без префикса (только если есть четкие разделители)
+            # 2. РФ формат без префикса (4 цифры + 6 цифр)
             r'(?<!\d)(?:\d{4}[\s\-\.,_]+\d{6}|\d{2}[\s\-\.,_]+\d{2}[\s\-\.,_]+\d{6})(?!\d)'
-            r'|'
-            # 3. Универсальная MRZ (международная машиночитаемая зона)
-            # Начинается с типа документа (P, I, A, C) + разделитель OCR (<, K, C, E, «) 
-            # Ловит паспорта любых стран (Чехия, РФ, ЕС и т.д.)
-            r'(?:P|I|A|C|V)[<KCE«][A-Z<KCE«]{2,3}[A-Z0-9<KCE«]{15,}'
+            r')'
+        ),
+        'passport_intl': (
+            r'(?i)(?:'
+            # 3. Универсальная MRZ (Максимально устойчивая к пробелам и мусору от OCR)
+            r'(?:P|I|A|C|V)[\s]*[A-Z<KCE«\(]{1,2}[\s]*[A-Z\s]{3,5}[\sA-Z0-9<KCE«\(]{10,}'
             r'|'
             # 4. Иностранные паспорта по английским ключевым словам
             r'(?:passport|document\s*no\.?)[^\w]{0,10}[A-Z0-9]{6,12}\b'
@@ -113,7 +113,7 @@ class PIIAnalyzer:
         self.ner_tagger = NewsNERTagger(self.emb)
 
     def _deduplicate_ids(self, items: set, threshold: float = 0.85) -> set:
-        """Слияние похожих идентификаторов (устранение опечаток OCR)."""
+        """Слияние похожих идентификаторов и устранение дублей MRZ + Visual."""
         unique_items = []
         for item in items:
             is_duplicate = False
@@ -126,18 +126,27 @@ class PIIAnalyzer:
                     break
             if not is_duplicate:
                 unique_items.append(item)
+
+        # --- НОВАЯ ЛОГИКА: Устранение двойного подсчета ---
+        # Если найден визуальный номер (короткий, из цифр) И строка MRZ (длинная, начинается с P/I/A),
+        # они относятся к одному документу в кадре. Оставляем только визуальный номер.
+        mrz_items = [it for it in unique_items if re.match(r'(?i)^[PIACV][A-Z]', it) and len(it) > 15]
+        visual_items = [it for it in unique_items if it not in mrz_items]
+
+        if mrz_items and visual_items:
+            # Нашли и то, и другое -> возвращаем только визуальные номера (схлопываем до 1 паспорта)
+            return set(visual_items)
+
         return set(unique_items)
 
     def _extract_names_from_mrz(self, text: str) -> set:
         """УРОВЕНЬ 1: Идеальный сценарий. Извлечение ФИО напрямую из машиночитаемой зоны (MRZ)."""
         names = set()
-        # Убираем все пробелы и переносы (OCR часто их вставляет хаотично внутрь MRZ)
         no_space_text = re.sub(r'[\s\n]+', '', text.upper())
 
-        # Ищем паттерн: Тип документа (P,I,A,C,V) + разделитель + Страна + Фамилия + двойной разделитель + Имя
-        # Учитываем, что OCR часто путает символ '<' с 'K', 'C', 'E', '«', '('
+        # Исправленный паттерн: разрешаем буквы сразу после типа документа (для PNRUS)
         mrz_match = re.search(
-            r'(?:P|I|A|C|V)[<KCE«\(]{1,2}[A-Z]{3}([A-Z]+)[<KCE«\(]{2}([A-Z<KCE«\(]+)',
+            r'(?:P|I|A|C|V)[A-Z<KCE«\(]{1,2}[A-Z]{3}([A-Z0-9]+)[<KCE«\(]{2}([A-Z0-9<KCE«\(]+)',
             no_space_text
         )
 
@@ -145,15 +154,16 @@ class PIIAnalyzer:
             surname_raw = mrz_match.group(1)
             given_raw = mrz_match.group(2)
 
-            # Фамилия: очищаем от случайных вкраплений разделителей
             clean_surname = re.sub(r'[<KCE«\(]+', ' ', surname_raw).strip()
-
-            # Имя: обрезаем строку по 3-м и более разделителям подряд (это стандартный конец зоны имени)
             given_split = re.split(r'[<KCE«\(]{3,}', given_raw)
             clean_given = re.sub(r'[<KCE«\(]+', ' ', given_split[0]).strip()
 
             if clean_surname and clean_given:
-                # Сохраняем в красивом формате Title Case: "Glinin Vitaliy"
+                # Очищаем типичные галлюцинации OCR в MRZ (8->Y, 3->Z, 0->O, 1->I)
+                tr_map = str.maketrans('8301', 'YZOI')
+                clean_surname = clean_surname.translate(tr_map)
+                clean_given = clean_given.translate(tr_map)
+
                 names.add(f"{clean_surname} {clean_given}".title())
 
         return names
@@ -263,19 +273,24 @@ class PIIAnalyzer:
         return final_fios
 
     def analyze_text(self, text: str) -> Dict[str, Any]:
-        findings = {k: set() for k in tuple(self.PATTERNS) + ('fio', 'address')}
+        actual_keys = set(k if not k.startswith('passport') else 'passport' for k in self.PATTERNS)
+        findings = {k: set() for k in actual_keys | {'fio', 'address'}}
 
         text_for_digits = self._heal_ocr_digits(text)
 
         # 1. Основные регулярные выражения (включая поиск паспортов)
         for key, pattern in self.PATTERNS.items():
-            # Паспорта и email/права ищем по сырому тексту
-            target_text = text if key in ('email', 'driver_license', 'passport') else text_for_digits
+            # Иностранные паспорта, email и права ищем по сырому тексту (чтобы не сломать буквы)
+            # А passport_rf и остальные госидентификаторы — по вылеченному тексту (text_for_digits)
+            target_text = text if key in ('email', 'driver_license', 'passport_intl') else text_for_digits
 
             for match in re.findall(pattern, target_text):
-                processed = self._process_match(key, match)
+                # Направляем находки из passport_rf и passport_intl в одну общую корзину 'passport'
+                save_key = 'passport' if key.startswith('passport') else key
+
+                processed = self._process_match(save_key, match)
                 if processed:
-                    findings[key].add(processed)
+                    findings[save_key].add(processed)
 
         # 2. Поиск адресов
         for match in ADDRESS_RE.findall(text):
