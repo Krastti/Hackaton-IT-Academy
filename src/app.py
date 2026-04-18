@@ -1,23 +1,42 @@
 import os
 import logging
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Set, cast
 from collections import defaultdict
 
 from tqdm import tqdm
-from extractor import ExtractResult, FileExtractor  # type: ignore
-from scanner import PIIAnalyzer  # type: ignore
-from reporter import PIIReporter  # type: ignore
-
+try:
+    from extractor import ExtractConfig, ExtractResult
+    from reporter import PIIReporter
+    from batch_router import collect_files, chunk_files, process_batch, ScanOutcome
+except ImportError:
+    from extractor import ExtractConfig, ExtractResult  # type: ignore
+    from reporter import PIIReporter  # type: ignore
+    from batch_router import collect_files, chunk_files, process_batch, ScanOutcome  # type: ignore
 
 logger = logging.getLogger(__name__)
 
-
 class PIIController:
-    def __init__(self, target_dir: str, output_prefix: str = 'report') -> None:
+    def __init__(
+        self,
+        target_dir: str,
+        output_prefix: str = 'report',
+        extract_config: ExtractConfig | None = None,
+        chunk_size: int = 100,
+        max_workers: int | None = None,
+    ) -> None:
         self.target_dir: str = target_dir
         self.output_prefix: str = output_prefix
-        self.analyzer: PIIAnalyzer = PIIAnalyzer()
-        self.extractor: FileExtractor = FileExtractor()
+        self.extract_config: ExtractConfig = extract_config or ExtractConfig()
+        if chunk_size <= 0:
+            raise ValueError('chunk_size must be a positive integer')
+        self.chunk_size: int = chunk_size
+
+        resolved_workers = max_workers if max_workers is not None else min(4, os.cpu_count() or 1)
+        if resolved_workers <= 0:
+            raise ValueError('max_workers must be a positive integer')
+        self.max_workers: int = resolved_workers
         self.reporter: PIIReporter = PIIReporter(output_prefix)
 
         # {путь: {stats, raw_data}}
@@ -55,46 +74,76 @@ class PIIController:
                 groups.append(current_group)
         return groups
 
+    def _merge_outcome(self, outcome: ScanOutcome) -> None:
+        f_path = outcome.file_path
+        self.extraction_registry[f_path] = outcome.extraction
+
+        if outcome.analysis is None:
+            return
+
+        self.file_registry[f_path] = outcome.analysis
+        for category, values in outcome.anchors.items():
+            for value in values:
+                self.anchor_index[value].add(f_path)
+
     def run_scan(self) -> None:
         # ----------------------------------------------------------------
         # Шаг 1: сканирование
         # ----------------------------------------------------------------
         print('[*] Шаг 1: Сканирование и сбор якорей...')
-        all_files: List[str] = []
-        for root, _, files in os.walk(self.target_dir):
-            for f in files:
-                all_files.append(os.path.join(root, f))
+        scan_started_at = time.perf_counter()
+        all_files = collect_files(self.target_dir)
+        batches = chunk_files(all_files, chunk_size=self.chunk_size)
 
-        for f_path in tqdm(all_files, desc='Сканирование', unit='файл'):
-            extraction: ExtractResult = self.extractor.extract(f_path)
-            self.extraction_registry[f_path] = extraction
+        logger.info(
+            'Найдено %s файлов для обработки. Батчей: %s. Размер батча: %s. Потоков: %s',
+            len(all_files),
+            len(batches),
+            self.chunk_size,
+            self.max_workers,
+        )
 
-            if extraction.status in ('failed', 'unsupported'):
-                logger.warning(
-                    'Не удалось извлечь текст из %s [%s]: %s',
-                    f_path,
-                    extraction.status,
-                    extraction.error or '; '.join(extraction.warnings),
+        future_to_batch_index: Dict[Future[List[ScanOutcome]], int] = {}
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            for batch_index, batch in enumerate(batches, start=1):
+                logger.info(
+                    'Запуск батча %s/%s (%s файлов)',
+                    batch_index,
+                    len(batches),
+                    len(batch),
+                )
+                future = executor.submit(process_batch, batch, self.extract_config)
+                future_to_batch_index[future] = batch_index
+
+            for future in tqdm(
+                as_completed(future_to_batch_index),
+                total=len(future_to_batch_index),
+                desc='Обработка батчей',
+                unit='батч',
+            ):
+                batch_index = future_to_batch_index[future]
+                batch_outcomes = future.result()
+
+                status_counts: Dict[str, int] = defaultdict(int)
+                for outcome in batch_outcomes:
+                    self._merge_outcome(outcome)
+                    status_counts[outcome.extraction.status] += 1
+
+                logger.info(
+                    'Завершён батч %s/%s: success=%s partial=%s empty=%s failed=%s unsupported=%s',
+                    batch_index,
+                    len(batches),
+                    status_counts.get('success', 0),
+                    status_counts.get('partial', 0),
+                    status_counts.get('empty', 0),
+                    status_counts.get('failed', 0),
+                    status_counts.get('unsupported', 0),
                 )
 
-            text: str = str(extraction.text)
-            if not text.strip():
-                continue
-            res: Dict[str, Any] = self.analyzer.analyze_text(text)
-            res['extraction'] = {
-                'status': extraction.status,
-                'extractor': extraction.extractor,
-                'warnings': extraction.warnings,
-                'error': extraction.error,
-            }
-            self.file_registry[f_path] = res
-
-            raw_data: Dict[str, List[str]] = cast(
-                Dict[str, List[str]], res.get('raw_data', {})
-            )
-            for cat in ['email', 'phone', 'snils', 'inn', 'passport_rf']:
-                for val in raw_data.get(cat, []):
-                    self.anchor_index[val].add(f_path)
+        logger.info(
+            'Этап сканирования завершён за %.2f сек.',
+            time.perf_counter() - scan_started_at,
+        )
 
         # ----------------------------------------------------------------
         # Шаг 2: группировка
@@ -111,5 +160,5 @@ class PIIController:
 
 
 if __name__ == '__main__':
-    app = PIIController('./test_dataset', 'report')
+    app = PIIController('../TestDataset', 'report')
     app.run_scan()

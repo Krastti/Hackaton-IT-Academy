@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Sequence
 
 import cv2
@@ -54,11 +55,13 @@ class ExtractContext:
     warnings: List[str] = field(default_factory=list)
     handler_name: str = ''
 
-
 class FileExtractor:
     _reader: ClassVar[Optional[easyocr.Reader]] = None
+    _reader_lock: ClassVar[Lock] = Lock()
     _default_config: ClassVar[ExtractConfig] = ExtractConfig()
     _pdf_module: ClassVar[Optional[Any]] = None
+    _pdf_module_lock: ClassVar[Lock] = Lock()
+    _pdf_module_checked: ClassVar[bool] = False
     _handlers: ClassVar[Dict[str, str]] = {
         '.pdf': '_extract_pdf',
         '.docx': '_extract_docx',
@@ -97,7 +100,9 @@ class FileExtractor:
         :return: Инициализированный easyocr.Reader
         """
         if cls._reader is None:
-            cls._reader = easyocr.Reader(['ru', 'en'], gpu=False)
+            with cls._reader_lock:
+                if cls._reader is None:
+                    cls._reader = easyocr.Reader(['ru', 'en'], gpu=False)
         return cls._reader
 
     @classmethod
@@ -106,20 +111,27 @@ class FileExtractor:
         Возвращает модуль для работы с PDF, если он доступен в окружении.
         :return: Модуль PDF-обработки или None
         """
-        if cls._pdf_module is not None:
+        if cls._pdf_module_checked:
             return cls._pdf_module
 
-        for module_name in ('pymupdf', 'fitz'):
-            try:
-                module = importlib.import_module(module_name)
-            except (ModuleNotFoundError, ImportError):
-                continue
-            except Exception as e:
-                logger.warning("Не удалось инициализировать PDF-модуль %s: %s", module_name, e)
-                continue
-            if hasattr(module, 'open'):
-                cls._pdf_module = module
-                return module
+        with cls._pdf_module_lock:
+            if cls._pdf_module_checked:
+                return cls._pdf_module
+
+            for module_name in ('pymupdf', 'fitz'):
+                try:
+                    module = importlib.import_module(module_name)
+                except (ModuleNotFoundError, ImportError):
+                    continue
+                except Exception as e:
+                    logger.warning("Не удалось инициализировать PDF-модуль %s: %s", module_name, e)
+                    continue
+                if hasattr(module, 'open'):
+                    cls._pdf_module = module
+                    cls._pdf_module_checked = True
+                    return module
+
+            cls._pdf_module_checked = True
 
         return None
 
