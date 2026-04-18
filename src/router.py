@@ -38,8 +38,8 @@ class Router:
         for file_path in self._iter_files():
             batch = self._make_batch(file_path)
 
-            #TODO Сделать обработку, есть batch is None
             if batch is None:
+                logger.warning("Файл пропущен (дубликат): %s", file_path.name)
                 continue
 
             batches.append(batch)
