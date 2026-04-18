@@ -37,7 +37,7 @@ def process_batch(batch: Batch, extractor_factory: ExtractorFactory, scanner: Sc
             batch.file_path,
         )
         # Шаг 1: Извлекаем текст из файла
-        extractor = extractor_factory.get(batch.file_path)
+        extractor = extractor_factory.get(batch.file_format)
         batch.start_extraction()
         text = extractor.extract(batch.file_path)
         batch.finish_extraction(text)
