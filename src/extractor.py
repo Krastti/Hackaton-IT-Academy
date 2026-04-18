@@ -3,6 +3,7 @@ import json
 import cv2  # type: ignore
 import easyocr  # type: ignore
 import pandas as pd  # type: ignore
+import numpy as np
 import fitz  # PyMuPDF  # type: ignore
 import docx  # type: ignore
 import docx2txt  # type: ignore
@@ -172,9 +173,18 @@ class FileExtractor:
         для лучшего распознавания текста на документах.
         """
         reader = FileExtractor._get_reader()
-        img = cv2.imread(file_path)
+
+        # ИСПРАВЛЕНИЕ БАГА OPENCV С КИРИЛЛИЦЕЙ:
+        # Читаем файл как массив байтов через numpy и декодируем
+        try:
+            img_array = np.fromfile(file_path, dtype=np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        except Exception as e:
+            print(f"[!] Ошибка чтения файла {file_path} через numpy: {e}")
+            return ''
 
         if img is None:
+            print(f"[!] OpenCV не смог декодировать изображение: {file_path}")
             return ''
 
         img_proc = FileExtractor._preprocess_for_ocr(img)
@@ -205,13 +215,6 @@ class FileExtractor:
         text_blocks: List[str] = []
         frame_idx: int = 0
 
-        # --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
-        log_file_path = f"{file_path}_ocr_log.txt"
-        with open(log_file_path, 'w', encoding='utf-8') as log_file:
-            log_file.write(f"=== Лог OCR для видео: {file_path} ===\n")
-        print(f"\n[*] Дебаг: логи OCR для видео пишутся в файл {log_file_path}")
-        # -----------------------------
-
         while True:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
@@ -239,14 +242,6 @@ class FileExtractor:
                 text_v = ' '.join(result_v)
                 text_blocks.append(text_v)
                 frame_texts.append(f"[Верт]: {text_v}")
-
-            # --- ЗАПИСЬ В ЛОГ И ВЫВОД В КОНСОЛЬ ---
-            if frame_texts:
-                log_message = f"[{current_sec:.1f} сек] " + " | ".join(frame_texts)
-                print(log_message)  # Вывод в терминал
-                with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                    log_file.write(log_message + '\n')
-            # --------------------------------------
 
             frame_idx = int(frame_idx + step)
 

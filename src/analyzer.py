@@ -128,6 +128,69 @@ class PIIAnalyzer:
                 unique_items.append(item)
         return set(unique_items)
 
+    def _extract_names_from_mrz(self, text: str) -> set:
+        """УРОВЕНЬ 1: Идеальный сценарий. Извлечение ФИО напрямую из машиночитаемой зоны (MRZ)."""
+        names = set()
+        # Убираем все пробелы и переносы (OCR часто их вставляет хаотично внутрь MRZ)
+        no_space_text = re.sub(r'[\s\n]+', '', text.upper())
+
+        # Ищем паттерн: Тип документа (P,I,A,C,V) + разделитель + Страна + Фамилия + двойной разделитель + Имя
+        # Учитываем, что OCR часто путает символ '<' с 'K', 'C', 'E', '«', '('
+        mrz_match = re.search(
+            r'(?:P|I|A|C|V)[<KCE«\(]{1,2}[A-Z]{3}([A-Z]+)[<KCE«\(]{2}([A-Z<KCE«\(]+)',
+            no_space_text
+        )
+
+        if mrz_match:
+            surname_raw = mrz_match.group(1)
+            given_raw = mrz_match.group(2)
+
+            # Фамилия: очищаем от случайных вкраплений разделителей
+            clean_surname = re.sub(r'[<KCE«\(]+', ' ', surname_raw).strip()
+
+            # Имя: обрезаем строку по 3-м и более разделителям подряд (это стандартный конец зоны имени)
+            given_split = re.split(r'[<KCE«\(]{3,}', given_raw)
+            clean_given = re.sub(r'[<KCE«\(]+', ' ', given_split[0]).strip()
+
+            if clean_surname and clean_given:
+                # Сохраняем в красивом формате Title Case: "Glinin Vitaliy"
+                names.add(f"{clean_surname} {clean_given}".title())
+
+        return names
+
+    def _extract_foreign_pii_by_anchors(self, text: str) -> Dict[str, set]:
+        """УРОВЕНЬ 2: Якорные слова. Поиск международных паспортов/ID по ключевым полям."""
+        anchored_data = {'fio': set(), 'passport': set()}
+
+        # 1. Поиск ФИО
+        # Ищем фамилию (после якоря идет минимум 2 буквы)
+        surnames = re.findall(r'(?i)\b(?:surname|last name|nom|фамилия)[\s:;\.\|]+([A-ZА-Я]{2,}(?:[- ][A-ZА-Я]{2,})?)',
+                              text)
+        # Ищем имя
+        names = re.findall(
+            r'(?i)\b(?:given names?|first name|name|pr[eé]noms?|имя)[\s:;\.\|]+([A-ZА-Я]{2,}(?:[\s-][A-ZА-Я]{2,})?)',
+            text)
+
+        # Комбинируем, если нашли и то, и другое
+        if surnames and names:
+            anchored_data['fio'].add(f"{surnames[0].strip()} {names[0].strip()}".title())
+        elif surnames:
+            anchored_data['fio'].add(surnames[0].strip().title())
+        elif names:
+            anchored_data['fio'].add(names[0].strip().title())
+
+        # 2. Поиск номеров документов
+        # Ищем 6-14 символов после якорных слов
+        doc_nos = re.findall(
+            r'(?i)\b(?:document no|passport no|id no|identity no|document number|номер документа)[\s:;\.\|№#]+([A-Z0-9]{6,14})\b',
+            text)
+        for doc in doc_nos:
+            cleaned = re.sub(r'[^A-Z0-9]', '', doc.upper())
+            if len(cleaned) >= 6:
+                anchored_data['passport'].add(cleaned)
+
+        return anchored_data
+
     def _heal_ocr_digits(self, text: str) -> str:
         replacements = {
             'O': '0', 'о': '0', 'О': '0',
@@ -204,9 +267,9 @@ class PIIAnalyzer:
 
         text_for_digits = self._heal_ocr_digits(text)
 
+        # 1. Основные регулярные выражения (включая поиск паспортов)
         for key, pattern in self.PATTERNS.items():
-            # Паспорта (теперь включая иностранные) обязательно ищем по сырому тексту,
-            # чтобы лечилка не превратила чешский ID "CZE" в "C2E" или "CZЕ"
+            # Паспорта и email/права ищем по сырому тексту
             target_text = text if key in ('email', 'driver_license', 'passport') else text_for_digits
 
             for match in re.findall(pattern, target_text):
@@ -214,10 +277,36 @@ class PIIAnalyzer:
                 if processed:
                     findings[key].add(processed)
 
+        # 2. Поиск адресов
         for match in ADDRESS_RE.findall(text):
             findings['address'].add(re.sub(r'\s+', ' ', match).strip())
 
-        findings['fio'].update(self._extract_fios(text))
+        # =========================================================
+        # 3. КАСКАДНЫЙ ПОИСК ФИО И ИНОСТРАННЫХ ДОКУМЕНТОВ
+        # =========================================================
+
+        # Уровень 1: MRZ (Машиночитаемая зона - 100% точность)
+        mrz_names = self._extract_names_from_mrz(text)
+
+        # Уровень 2: Якорные слова (для иностранных ID без MRZ)
+        anchor_data = self._extract_foreign_pii_by_anchors(text)
+
+        # Оркестрация ФИО: Берем самый надежный вариант
+        if mrz_names:
+            findings['fio'].update(mrz_names)
+        elif anchor_data['fio']:
+            findings['fio'].update(anchor_data['fio'])
+        else:
+            # Уровень 3: Нейросеть Natasha (если нет ни MRZ, ни понятных якорей)
+            findings['fio'].update(self._extract_fios(text))
+
+        # Дополняем паспорта теми, что нашли по английским якорям
+        if anchor_data['passport']:
+            findings['passport'].update(anchor_data['passport'])
+
+        # =========================================================
+        # 4. Дедупликация OCR-ошибок (чтобы не было 5 паспортов вместо 1)
+        # =========================================================
         findings['passport'] = self._deduplicate_ids(findings['passport'])
         findings['snils'] = self._deduplicate_ids(findings['snils'])
         findings['inn'] = self._deduplicate_ids(findings['inn'])
@@ -227,7 +316,6 @@ class PIIAnalyzer:
         return {
             'stats': {
                 'common_pii': sum(counts[k] for k in ('fio', 'email', 'phone', 'address')),
-                # Заменили passport_rf на passport в подсчете статы
                 'gov_ids': sum(counts[k] for k in ('passport', 'snils', 'inn', 'driver_license')),
                 'payment_info': sum(counts[k] for k in ('bank_card', 'bik', 'cvv')),
                 'special_pii': len(SPECIAL_PII_RE.findall(text)),
