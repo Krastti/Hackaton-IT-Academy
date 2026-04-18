@@ -1,115 +1,99 @@
-import os
+import argparse
 import logging
-from typing import Dict, Any, List, Set, cast
-from collections import defaultdict
+import sys
 
-from tqdm import tqdm
-from extractor import ExtractResult, FileExtractor  # type: ignore
-from scanner import PIIAnalyzer  # type: ignore
-from reporter import PIIReporter  # type: ignore
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from router import Router
+from batcher import Batch, BatchStatus
+from reporter import Reporter
+from scanner import Scanner
+from extractor import ExtractorFactory
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers = [
+        logging.StreamHandler(sys.stdout)
+        logging.FileHandler("app.log", encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 
-class PIIController:
-    def __init__(self, target_dir: str, output_prefix: str = 'report') -> None:
-        self.target_dir: str = target_dir
-        self.output_prefix: str = output_prefix
-        self.analyzer: PIIAnalyzer = PIIAnalyzer()
-        self.extractor: FileExtractor = FileExtractor()
-        self.reporter: PIIReporter = PIIReporter(output_prefix)
+# TODO Добавить extractor_factory из extractor и scanner из scanner
+def process_batch(batch: Batch, extractor_factory: ExtractorFactory, scanner: Scanner) -> Batch:
+    """Обрабатывает один батч: extraction -> scanner"""
+    try:
+        # Шаг 1: Извлекаем текст из файла
+        extractor = ...
+        batch.start_extraction()
+        text = ...
+        batch.finish_extraction(text)
 
-        # {путь: {stats, raw_data}}
-        self.file_registry: Dict[str, Dict[str, Any]] = {}
-        self.extraction_registry: Dict[str, ExtractResult] = {}
-        # {нормализованное_значение: {набор_путей}}
-        self.anchor_index: Dict[str, Set[str]] = defaultdict(set)
+        # Шаг 2: Находим ПДн в тексте
+        batch.start_scanning()
+        markup = ...
+        batch.finish_scanning(markup)
 
-    def _find_groups(self) -> List[Set[str]]:
-        """Алгоритм поиска связанных компонентов (Union-Find по якорям)."""
-        visited: Set[str] = set()
-        groups: List[Set[str]] = []
-        all_files: List[str] = list(self.file_registry.keys())
+    except Exception as e:
+        logger.error("Батч %s завершился с ошибкой: %s", batch.id, e)
+        batch.fail(e)
+    return batch
 
-        for file_path in all_files:
-            if file_path not in visited:
-                current_group: Set[str] = set()
-                queue: List[str] = [file_path]
-                visited.add(file_path)
+def run(dataset_path: Path, output_dir: Path, workers: int):
+    router = Router(dataset_path)
+    batches = router.route()
+    logger.info("Роутер создал %d батчей", len(batches))
 
-                while queue:
-                    node: str = queue.pop(0)
-                    current_group.add(node)
-                    node_data: Dict[str, Any] = self.file_registry[node]
-                    raw_data: Dict[str, List[str]] = cast(
-                        Dict[str, List[str]], node_data.get('raw_data', {})
-                    )
-                    for category in ['email', 'phone', 'snils', 'inn', 'passport_rf']:
-                        for value in raw_data.get(category, []):
-                            for linked_file in self.anchor_index.get(value, set()):
-                                if linked_file not in visited:
-                                    visited.add(linked_file)
-                                    queue.append(linked_file)
+    #TODO Добавить extractor_factory из extractor и scanner из scanner
+    extractor_factory = ...
+    scanner = ...
+    reporter = Reporter(output_dir)
 
-                groups.append(current_group)
-        return groups
+    # Параллельная обработка батчей
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(process_batch, batch, extractor_factory, scanner): batch
+            for batch in batches
+        }
 
-    def run_scan(self) -> None:
-        # ----------------------------------------------------------------
-        # Шаг 1: сканирование
-        # ----------------------------------------------------------------
-        print('[*] Шаг 1: Сканирование и сбор якорей...')
-        all_files: List[str] = []
-        for root, _, files in os.walk(self.target_dir):
-            for f in files:
-                all_files.append(os.path.join(root, f))
+        for future in as_completed(futures):
+            batch = future.result()
 
-        for f_path in tqdm(all_files, desc='Сканирование', unit='файл'):
-            extraction: ExtractResult = self.extractor.extract(f_path)
-            self.extraction_registry[f_path] = extraction
+            while batch.can_retry:
+                logger.info("Повтор батча %s (попытка %d", batch.id, batch.attempt + 1)
+                batch = process_batch(batch, extractor_factory, scanner)
 
-            if extraction.status in ('failed', 'unsupported'):
-                logger.warning(
-                    'Не удалось извлечь текст из %s [%s]: %s',
-                    f_path,
-                    extraction.status,
-                    extraction.error or '; '.join(extraction.warnings),
-                )
+            if batch.status == BatchStatus.DONE:
+                reporter.add(batch.to_report())
+            else:
+                logger.error("Батч %s окончательно упал после %d попыток", batch.id, batch.attempt)
 
-            text: str = str(extraction.text)
-            if not text.strip():
-                continue
-            res: Dict[str, Any] = self.analyzer.analyze_text(text)
-            res['extraction'] = {
-                'status': extraction.status,
-                'extractor': extraction.extractor,
-                'warnings': extraction.warnings,
-                'error': extraction.error,
-            }
-            self.file_registry[f_path] = res
+    # Запись отчётов
+    paths = reporter.write()
+    for fmt, path in paths.items():
+        logger.info("Отчёт [%s]: %s", fmt, path)
 
-            raw_data: Dict[str, List[str]] = cast(
-                Dict[str, List[str]], res.get('raw_data', {})
-            )
-            for cat in ['email', 'phone', 'snils', 'inn', 'passport_rf']:
-                for val in raw_data.get(cat, []):
-                    self.anchor_index[val].add(f_path)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="PII Detection Pipeline")
+    parser.add_argument("--dataset", required=True, help="Путь к датасету")
+    parser.add_argument("--output", default='reports', help='Папка для отчётов')
+    parser.add_argument("--workers", default=4, type=int, help="Количество параллельных воркеров")
+    args = parser.parse_args()
 
-        # ----------------------------------------------------------------
-        # Шаг 2: группировка
-        # ----------------------------------------------------------------
-        print('[*] Шаг 2: Группировка файлов и классификация...')
-        groups: List[Set[str]] = self._find_groups()
+    dataset_path = Path(args.dataset)
+    if not dataset_path.exists():
+        logger.error("Путь к датасету не существует: %s", dataset_path)
+        sys.exit(1)
 
-        # ----------------------------------------------------------------
-        # Шаг 3: запись отчётов
-        # ----------------------------------------------------------------
-        self.reporter.write_reports(self.file_registry, groups)
+    run (
+        dataset_path=dataset_path,
+        output_dir=Path(args.output),
+        workers=args.workers,
+    )
 
-        print(f'[+] Отчёты: {self.output_prefix}.csv / .json / .md')
-
-
-if __name__ == '__main__':
-    app = PIIController('./test_dataset', 'report')
-    app.run_scan()
+if __name__ == "__main__":
+    main()

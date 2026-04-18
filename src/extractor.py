@@ -1,19 +1,20 @@
 import json
+import importlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Sequence
 
-import cv2  # type: ignore
-import docx  # type: ignore
-import easyocr  # type: ignore
-import fitz  # PyMuPDF  # type: ignore
-import pandas as pd  # type: ignore
-from bs4 import BeautifulSoup  # type: ignore
-from striprtf.striprtf import rtf_to_text  # type: ignore
-
+import cv2
+import docx
+import easyocr
+import pandas as pd
+from bs4 import BeautifulSoup
+from striprtf.striprtf import rtf_to_text
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +55,13 @@ class ExtractContext:
     warnings: List[str] = field(default_factory=list)
     handler_name: str = ''
 
-
 class FileExtractor:
     _reader: ClassVar[Optional[easyocr.Reader]] = None
+    _reader_lock: ClassVar[Lock] = Lock()
     _default_config: ClassVar[ExtractConfig] = ExtractConfig()
+    _pdf_module: ClassVar[Optional[Any]] = None
+    _pdf_module_lock: ClassVar[Lock] = Lock()
+    _pdf_module_checked: ClassVar[bool] = False
     _handlers: ClassVar[Dict[str, str]] = {
         '.pdf': '_extract_pdf',
         '.docx': '_extract_docx',
@@ -96,8 +100,40 @@ class FileExtractor:
         :return: Инициализированный easyocr.Reader
         """
         if cls._reader is None:
-            cls._reader = easyocr.Reader(['ru', 'en'], gpu=False)
+            with cls._reader_lock:
+                if cls._reader is None:
+                    cls._reader = easyocr.Reader(['ru', 'en'], gpu=False)
         return cls._reader
+
+    @classmethod
+    def _get_pdf_module(cls) -> Optional[Any]:
+        """
+        Возвращает модуль для работы с PDF, если он доступен в окружении.
+        :return: Модуль PDF-обработки или None
+        """
+        if cls._pdf_module_checked:
+            return cls._pdf_module
+
+        with cls._pdf_module_lock:
+            if cls._pdf_module_checked:
+                return cls._pdf_module
+
+            for module_name in ('pymupdf', 'fitz'):
+                try:
+                    module = importlib.import_module(module_name)
+                except (ModuleNotFoundError, ImportError):
+                    continue
+                except Exception as e:
+                    logger.warning("Не удалось инициализировать PDF-модуль %s: %s", module_name, e)
+                    continue
+                if hasattr(module, 'open'):
+                    cls._pdf_module = module
+                    cls._pdf_module_checked = True
+                    return module
+
+            cls._pdf_module_checked = True
+
+        return None
 
     @classmethod
     def extract(cls, file_path: str, config: Optional[ExtractConfig] = None) -> ExtractResult:
@@ -260,8 +296,15 @@ class FileExtractor:
         :param context:
         :return:
         """
+        pdf_module = self._get_pdf_module()
+        if pdf_module is None:
+            context.warnings.append(
+                'PDF-обработка недоступна: не найден совместимый модуль PyMuPDF/fitz'
+            )
+            return ''
+
         text_blocks: List[str] = []
-        with fitz.open(file_path) as doc:
+        with pdf_module.open(file_path) as doc:
             page_count = len(doc)
             page_limit = min(page_count, context.config.max_pdf_pages)
             if page_count > page_limit:
@@ -270,7 +313,15 @@ class FileExtractor:
                 )
 
             for page_index in range(page_limit):
-                text_blocks.append(doc[page_index].get_text())
+                page = doc[page_index]
+                page_text = self._normalize_block(page.get_text())
+                if page_text:
+                    text_blocks.append(page_text)
+                    continue
+
+                ocr_text = self._extract_pdf_page_with_ocr(page, context)
+                if ocr_text:
+                    text_blocks.append(ocr_text)
 
         return self._merge_blocks(text_blocks)
 
@@ -298,6 +349,12 @@ class FileExtractor:
         """
         antiword_path = shutil.which('antiword')
         if antiword_path is None:
+            fallback_text = self._extract_doc_as_binary_text(file_path, context)
+            if fallback_text:
+                context.warnings.append(
+                    'antiword не найден; использовано упрощённое извлечение текста из бинарного .doc'
+                )
+                return fallback_text
             context.warnings.append(
                 'Для извлечения .doc требуется antiword; файл помечен как частично поддерживаемый'
             )
@@ -347,9 +404,7 @@ class FileExtractor:
 
         return self._serialize_table(df, context)
 
-    def _read_csv_with_fallback(
-        self, file_path: str, context: ExtractContext, delimiter: str = ','
-    ) -> TableFrame:
+    def _read_csv_with_fallback(self, file_path: str, context: ExtractContext, delimiter: str = ',') -> TableFrame:
         """
         Пытается прочитать CSV/TSV в нескольких кодировках.
         :param file_path:
@@ -380,6 +435,34 @@ class FileExtractor:
         if last_decode_error:
             raise UnicodeDecodeError('csv', b'', 0, 1, last_decode_error)
         raise ValueError(f'Не удалось декодировать файл таблицы: {file_path}')
+
+    def _extract_doc_as_binary_text(
+        self, file_path: str, context: ExtractContext
+    ) -> str:
+        """
+        Пытается извлечь читаемые строковые фрагменты из бинарного DOC без внешних утилит.
+        :param file_path:
+        :param context:
+        :return:
+        """
+        try:
+            with open(file_path, 'rb') as file:
+                raw_data = file.read()
+        except OSError as exc:
+            context.warnings.append(f'Не удалось прочитать .doc-файл: {exc}')
+            return ''
+
+        text_candidates: List[str] = []
+        for encoding in ('utf-16le', 'cp1251', 'latin-1'):
+            try:
+                decoded = raw_data.decode(encoding, errors='ignore')
+            except LookupError:
+                continue
+
+            fragments = re.findall(r'[\wА-Яа-яЁё.,;:()@/\- ]{4,}', decoded)
+            text_candidates.extend(fragment.strip() for fragment in fragments if fragment.strip())
+
+        return self._merge_blocks(text_candidates)
 
     def _serialize_table(self, df: TableFrame, context: ExtractContext) -> str:
         """
@@ -488,6 +571,62 @@ class FileExtractor:
         else:
             processed = cv2.equalizeHist(gray)
         return cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+
+    def _extract_pdf_page_with_ocr(self, page: Any, context: ExtractContext) -> str:
+        """
+        Рендерит страницу PDF в изображение и извлекает текст через OCR.
+        :param page:
+        :param context:
+        :return:
+        """
+        if not hasattr(page, 'get_pixmap'):
+            context.warnings.append(
+                'OCR для PDF недоступен: модуль PDF не поддерживает рендеринг страниц'
+            )
+            return ''
+
+        try:
+            pixmap = page.get_pixmap(dpi=200)
+        except TypeError:
+            try:
+                pixmap = page.get_pixmap()
+            except Exception as exc:
+                context.warnings.append(f'Не удалось отрендерить страницу PDF для OCR: {exc}')
+                return ''
+        except Exception as exc:
+            context.warnings.append(f'Не удалось отрендерить страницу PDF для OCR: {exc}')
+            return ''
+
+        width = getattr(pixmap, 'width', 0)
+        height = getattr(pixmap, 'height', 0)
+        channels = 4 if getattr(pixmap, 'alpha', 0) else max(getattr(pixmap, 'n', 3), 1)
+        if width <= 0 or height <= 0:
+            context.warnings.append('Не удалось определить размер страницы PDF для OCR')
+            return ''
+
+        try:
+            import numpy as np  # type: ignore
+        except Exception as exc:
+            context.warnings.append(f'Не удалось загрузить numpy для OCR PDF: {exc}')
+            return ''
+
+        try:
+            page_image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+                height, width, channels
+            )
+        except ValueError as exc:
+            context.warnings.append(f'Не удалось преобразовать страницу PDF в изображение: {exc}')
+            return ''
+
+        if channels == 4:
+            page_image = cv2.cvtColor(page_image, cv2.COLOR_RGBA2BGR)
+        elif channels == 1:
+            page_image = cv2.cvtColor(page_image, cv2.COLOR_GRAY2BGR)
+        else:
+            page_image = cv2.cvtColor(page_image, cv2.COLOR_RGB2BGR)
+
+        processed = self._preprocess_for_ocr(page_image, mode='document')
+        return self._run_ocr(processed, context, rotate_passes=context.config.image_rotate_passes)
 
     def _run_ocr(
         self, image: ImageLike, context: ExtractContext, rotate_passes: int
