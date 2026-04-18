@@ -1,7 +1,7 @@
 import re
 from typing import Dict, Set, List, Any, Optional
 import sys
-import pymorphy3  # type: ignore
+import pymorphy3
 
 sys.modules['pymorphy2'] = pymorphy3
 sys.modules['pymorphy2.analyzer'] = pymorphy3.analyzer
