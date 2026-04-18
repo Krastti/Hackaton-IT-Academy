@@ -27,13 +27,7 @@ logger = logging.getLogger(__name__)
 worker_progress_lock = threading.Lock()
 worker_progress_bars: dict[str, tqdm] = {}
 
-
-# TODO Добавить extractor_factory из extractor и scanner из scanner
-def process_batch(
-    batch: Batch,
-    extractor_factory: ExtractorFactory,
-    scanner: Scanner,
-) -> Batch:
+def process_batch(batch: Batch, extractor_factory: ExtractorFactory, scanner: Scanner) -> Batch:
     """Обрабатывает один батч: extraction -> scanner"""
     try:
         batch.metadata["worker_name"] = threading.current_thread().name
@@ -43,21 +37,20 @@ def process_batch(
             batch.file_path,
         )
         # Шаг 1: Извлекаем текст из файла
-        extractor = ...
+        extractor = extractor_factory.get(batch.file_path)
         batch.start_extraction()
-        text = ...
+        text = extractor.extract(batch.file_path)
         batch.finish_extraction(text)
 
         # Шаг 2: Находим ПДн в тексте
         batch.start_scanning()
-        markup = ...
+        markup = scanner.scan(batch.extracted_text)
         batch.finish_scanning(markup)
 
     except Exception as e:
         logger.error("Батч %s завершился с ошибкой: %s", batch.id, e)
         batch.fail(e)
     return batch
-
 
 def _get_worker_progress_bar(worker_name: str, total: int) -> tqdm:
     with worker_progress_lock:
@@ -77,9 +70,8 @@ def run(dataset_path: Path, output_dir: Path, workers: int):
     batches = router.route()
     logger.info("Роутер создал %d батчей", len(batches))
 
-    #TODO Добавить extractor_factory из extractor и scanner из scanner
-    extractor_factory = ...
-    scanner = ...
+    extractor_factory = ExtractorFactory()
+    scanner = Scanner()
     reporter = Reporter(output_dir)
 
     # Параллельная обработка батчей
@@ -96,7 +88,7 @@ def run(dataset_path: Path, output_dir: Path, workers: int):
             bar.update(1)
 
             while batch.can_retry:
-                logger.info("Повтор батча %s (попытка %d", batch.id, batch.attempt + 1)
+                logger.info("Повтор батча %s (попытка %d)", batch.id, batch.attempt + 1)
                 batch = pool.submit(
                     process_batch,
                     batch,
