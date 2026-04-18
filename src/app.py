@@ -2,6 +2,7 @@ import argparse
 import logging
 import sys
 import threading
+import warnings
 
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,17 +16,28 @@ from scanner import Scanner
 from extractor import ExtractorFactory
 
 
+class TqdmLoggingHandler(logging.Handler):
+    """Writes log records above the active tqdm bar without breaking it."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            tqdm.write(msg, file=sys.stderr)
+        except Exception:
+            self.handleError(record)
+
+
 logging.basicConfig(
     level=logging.INFO,
     format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers = [
-        logging.StreamHandler(sys.stdout),
+        TqdmLoggingHandler(),
         logging.FileHandler("app.log", encoding="utf-8"),
     ],
 )
+logging.captureWarnings(True)
+warnings.simplefilter("default")
 logger = logging.getLogger(__name__)
-worker_progress_lock = threading.Lock()
-worker_progress_bars: dict[str, tqdm] = {}
 
 def process_batch(batch: Batch, extractor_factory: ExtractorFactory, scanner: Scanner) -> Batch:
     """Обрабатывает один батч: extraction -> scanner"""
@@ -52,19 +64,6 @@ def process_batch(batch: Batch, extractor_factory: ExtractorFactory, scanner: Sc
         batch.fail(e)
     return batch
 
-def _get_worker_progress_bar(worker_name: str, total: int) -> tqdm:
-    with worker_progress_lock:
-        bar = worker_progress_bars.get(worker_name)
-        if bar is None:
-            bar = tqdm(
-                total=total,
-                desc=worker_name,
-                unit="file",
-                dynamic_ncols=True,
-            )
-            worker_progress_bars[worker_name] = bar
-        return bar
-
 def run(dataset_path: Path, output_dir: Path, workers: int):
     router = Router(dataset_path)
     batches = router.route()
@@ -76,42 +75,35 @@ def run(dataset_path: Path, output_dir: Path, workers: int):
 
     # Параллельная обработка батчей
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
+        future_to_batch = {
             pool.submit(process_batch, batch, extractor_factory, scanner): batch
             for batch in batches
         }
 
-        for future in as_completed(futures):
-            batch = future.result()
-            worker_name = batch.metadata.get("worker_name", threading.current_thread().name)
-            bar = _get_worker_progress_bar(worker_name, len(batches))
-            bar.update(1)
+        with tqdm(total=len(batches), unit="file", dynamic_ncols=True, file=sys.stderr) as progress_bar:
+            for future in as_completed(future_to_batch):
+                batch = future.result()
+                progress_bar.update(1)
 
-            while batch.can_retry:
-                logger.info("Повтор батча %s (попытка %d)", batch.id, batch.attempt + 1)
-                batch = pool.submit(
-                    process_batch,
-                    batch,
-                    extractor_factory,
-                    scanner,
-                ).result()
-                worker_name = batch.metadata.get("worker_name", threading.current_thread().name)
-                bar = _get_worker_progress_bar(worker_name, len(batches))
-                bar.update(1)
+                while batch.can_retry:
+                    logger.info("Повтор батча %s (попытка %d)", batch.id, batch.attempt + 1)
+                    batch = pool.submit(
+                        process_batch,
+                        batch,
+                        extractor_factory,
+                        scanner,
+                    ).result()
+                    progress_bar.update(1)
 
-            if batch.status == BatchStatus.DONE:
-                reporter.add(batch.to_report())
-            else:
-                logger.error("Батч %s окончательно упал после %d попыток", batch.id, batch.attempt)
+                if batch.status == BatchStatus.DONE:
+                    reporter.add(batch.to_report())
+                else:
+                    logger.error("Батч %s окончательно упал после %d попыток", batch.id, batch.attempt)
 
     # Запись отчётов
     paths = reporter.write()
     for fmt, path in paths.items():
         logger.info("Отчёт [%s]: %s", fmt, path)
-
-    for bar in worker_progress_bars.values():
-        bar.close()
-    worker_progress_bars.clear()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PII Detection Pipeline")
