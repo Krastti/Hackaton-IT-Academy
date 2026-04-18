@@ -79,11 +79,32 @@ class FileExtractor:
 
     @staticmethod
     def _extract_doc(file_path: str) -> str:
-        """Извлечение текста из .doc через docx2txt (не требует LibreOffice)."""
+        """Извлечение текста из .doc.
+        Сначала пробуем docx2txt (если это docx со старым расширением),
+        затем фоллбэк на чтение бинарных строк (вытягиваем кириллицу и цифры)."""
         try:
-            return docx2txt.process(file_path) or ''
+            text = docx2txt.process(file_path)
+            if text:
+                return text
+        except Exception:
+            pass  # Это нормально для старых .doc файлов
+
+        # Фолбэк: читаем бинарный файл и ищем в нем текстовые данные
+        try:
+            with open(file_path, 'rb') as f:
+                content = f.read()
+            # Пытаемся декодировать частые кодировки Word
+            text_utf16 = content.decode('utf-16-le', errors='ignore')
+            text_cp1251 = content.decode('cp1251', errors='ignore')
+
+            # Очищаем от бинарного мусора, оставляем буквы, цифры и пунктуацию
+            import re
+            cleaned_utf16 = re.sub(r'[^\w\s@.,-]', ' ', text_utf16)
+            cleaned_cp1251 = re.sub(r'[^\w\s@.,-]', ' ', text_cp1251)
+
+            return cleaned_utf16 + " " + cleaned_cp1251
         except Exception as e:
-            print(f'[!] docx2txt не смог открыть {os.path.basename(file_path)}: {e}')
+            print(f'[!] Ошибка при чтении {os.path.basename(file_path)}: {e}')
             return ''
 
     @staticmethod
@@ -119,8 +140,12 @@ class FileExtractor:
                 df = pd.read_parquet(file_path)
             else:
                 df = pd.read_excel(file_path)
-            return str(df.to_string(index=False))
-        except Exception:
+
+            # ИСПРАВЛЕНИЕ: Заменяем сверхмедленный to_string() на быстрый to_csv()
+            # Это мгновенно склеит таблицу через пробелы без вычислений ширины колонок
+            return df.to_csv(index=False, sep=' ', na_rep='')
+        except Exception as e:
+            print(f"[!] Ошибка чтения таблицы {os.path.basename(file_path)}: {e}")
             return ''
 
     @staticmethod
@@ -167,15 +192,9 @@ class FileExtractor:
 
     @staticmethod
     def _extract_image(file_path: str) -> str:
-        """Двойной проход EasyOCR: горизонталь + поворот на 90°.
-
-        Каждый кадр предобрабатывается в ЧБ с адаптивным порогом
-        для лучшего распознавания текста на документах.
-        """
+        """Двойной проход EasyOCR: горизонталь + поворот на 90°."""
         reader = FileExtractor._get_reader()
 
-        # ИСПРАВЛЕНИЕ БАГА OPENCV С КИРИЛЛИЦЕЙ:
-        # Читаем файл как массив байтов через numpy и декодируем
         try:
             img_array = np.fromfile(file_path, dtype=np.uint8)
             img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -188,12 +207,18 @@ class FileExtractor:
             return ''
 
         img_proc = FileExtractor._preprocess_for_ocr(img)
-        res_h: List[str] = reader.readtext(img_proc, detail=0, paragraph=True)
-        text_horizontal: str = ' '.join(res_h)
 
-        img_rotated = cv2.rotate(img_proc, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        res_v: List[str] = reader.readtext(img_rotated, detail=0, paragraph=True)
-        text_vertical: str = ' '.join(res_v)
+        # Запрещаем EasyOCR плодить процессы параметром workers=0
+        try:
+            res_h: List[str] = reader.readtext(img_proc, detail=0, paragraph=True, workers=0)
+            text_horizontal: str = ' '.join(res_h)
+
+            img_rotated = cv2.rotate(img_proc, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            res_v: List[str] = reader.readtext(img_rotated, detail=0, paragraph=True, workers=0)
+            text_vertical: str = ' '.join(res_v)
+        except Exception as e:
+            print(f"[!] Внутренняя ошибка OCR: {e}")
+            return ''
 
         return text_horizontal + ' ' + text_vertical
 
@@ -209,9 +234,7 @@ class FileExtractor:
         total_seconds: float = total_frames / fps_val
         max_seconds: float = min(total_seconds, 120.0)
 
-        # Шаг: 1 кадр каждые 2 секунды (ускорит дебаг и уменьшит дубли)
         step: float = fps_val * 2.0
-
         text_blocks: List[str] = []
         frame_idx: int = 0
 
@@ -226,22 +249,24 @@ class FileExtractor:
                 break
 
             frame_processed = FileExtractor._preprocess_for_ocr(frame)
-            frame_texts = []  # Собираем текст текущего кадра для лога
+            frame_texts = []
 
-            # Горизонтальное чтение
-            result_h: List[str] = reader.readtext(frame_processed, detail=0, paragraph=True)
-            if result_h:
-                text_h = ' '.join(result_h)
-                text_blocks.append(text_h)
-                frame_texts.append(f"[Гориз]: {text_h}")
+            # Запрещаем EasyOCR плодить процессы параметром workers=0
+            try:
+                result_h: List[str] = reader.readtext(frame_processed, detail=0, paragraph=True, workers=0)
+                if result_h:
+                    text_h = ' '.join(result_h)
+                    text_blocks.append(text_h)
+                    frame_texts.append(f"[Гориз]: {text_h}")
 
-            # Вертикальное чтение
-            frame_rotated = cv2.rotate(frame_processed, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            result_v: List[str] = reader.readtext(frame_rotated, detail=0, paragraph=True)
-            if result_v:
-                text_v = ' '.join(result_v)
-                text_blocks.append(text_v)
-                frame_texts.append(f"[Верт]: {text_v}")
+                frame_rotated = cv2.rotate(frame_processed, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                result_v: List[str] = reader.readtext(frame_rotated, detail=0, paragraph=True, workers=0)
+                if result_v:
+                    text_v = ' '.join(result_v)
+                    text_blocks.append(text_v)
+                    frame_texts.append(f"[Верт]: {text_v}")
+            except Exception as e:
+                print(f"[!] Внутренняя ошибка OCR при чтении кадра: {e}")
 
             frame_idx = int(frame_idx + step)
 

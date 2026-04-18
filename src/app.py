@@ -9,6 +9,8 @@ from datetime import datetime
 from tqdm import tqdm  # type: ignore
 from extractor import FileExtractor  # type: ignore
 from analyzer import PIIAnalyzer  # type: ignore
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # Порог «большого объёма» по ТЗ: «десятки тысяч записей»
 LARGE_VOLUME_THRESHOLD: int = 1000
@@ -128,27 +130,31 @@ class PIIController:
         # ----------------------------------------------------------------
         print('[*] Шаг 1: Сканирование и сбор якорей...')
         all_files: List[str] = []
+
+        # Сначала просто собираем ВСЕ пути ко всем файлам в список
         for root, _, files in os.walk(self.target_dir):
             for f in files:
                 all_files.append(os.path.join(root, f))
 
-                # Создаем объект прогресс-бара отдельно
-            pbar = tqdm(all_files, desc='Сканирование', unit='файл')
+        # Вышли из цикла os.walk! Теперь создаем прогресс-бар один раз
+        pbar = tqdm(all_files, desc='Сканирование', unit='файл')
 
-            for f_path in pbar:
-                    # Добавляем имя текущего файла (без полного пути) справа от прогресс-бара
-                pbar.set_postfix_str(f"Файл: {os.path.basename(f_path)}")
+        # Запускаем цикл обработки файлов
+        for f_path in pbar:
+            # Обновляем имя файла в консоли
+            pbar.set_postfix_str(f"Файл: {os.path.basename(f_path)}")
 
-                text: str = str(self.extractor.extract_text(f_path))
-                #if not text.strip():
-                #    continue
+            # Извлекаем текст
+            text: str = str(self.extractor.extract_text(f_path))
+
+            # ВАЖНО: Анализ и сохранение должны быть ВНУТРИ этого цикла (с отступом)
             res: Dict[str, Any] = self.analyzer.analyze_text(text)
             self.file_registry[f_path] = res
 
             raw_data: Dict[str, List[str]] = cast(
                 Dict[str, List[str]], res.get('raw_data', {})
             )
-            # ИСПРАВЛЕНО: заменили passport_rf на passport
+
             for cat in ['email', 'phone', 'snils', 'inn', 'passport']:
                 for val in raw_data.get(cat, []):
                     self.anchor_index[val].add(f_path)
