@@ -1,9 +1,12 @@
 import argparse
 import logging
 import sys
+import threading
 
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from tqdm import tqdm
 
 from router import Router
 from batcher import Batch, BatchStatus
@@ -21,12 +24,24 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+worker_progress_lock = threading.Lock()
+worker_progress_bars: dict[str, tqdm] = {}
 
 
 # TODO Добавить extractor_factory из extractor и scanner из scanner
-def process_batch(batch: Batch, extractor_factory: ExtractorFactory, scanner: Scanner) -> Batch:
+def process_batch(
+    batch: Batch,
+    extractor_factory: ExtractorFactory,
+    scanner: Scanner,
+) -> Batch:
     """Обрабатывает один батч: extraction -> scanner"""
     try:
+        batch.metadata["worker_name"] = threading.current_thread().name
+        logger.info(
+            "Воркер %s обрабатывает файл: %s",
+            threading.current_thread().name,
+            batch.file_path,
+        )
         # Шаг 1: Извлекаем текст из файла
         extractor = ...
         batch.start_extraction()
@@ -42,6 +57,20 @@ def process_batch(batch: Batch, extractor_factory: ExtractorFactory, scanner: Sc
         logger.error("Батч %s завершился с ошибкой: %s", batch.id, e)
         batch.fail(e)
     return batch
+
+
+def _get_worker_progress_bar(worker_name: str, total: int) -> tqdm:
+    with worker_progress_lock:
+        bar = worker_progress_bars.get(worker_name)
+        if bar is None:
+            bar = tqdm(
+                total=total,
+                desc=worker_name,
+                unit="file",
+                dynamic_ncols=True,
+            )
+            worker_progress_bars[worker_name] = bar
+        return bar
 
 def run(dataset_path: Path, output_dir: Path, workers: int):
     router = Router(dataset_path)
@@ -62,10 +91,21 @@ def run(dataset_path: Path, output_dir: Path, workers: int):
 
         for future in as_completed(futures):
             batch = future.result()
+            worker_name = batch.metadata.get("worker_name", threading.current_thread().name)
+            bar = _get_worker_progress_bar(worker_name, len(batches))
+            bar.update(1)
 
             while batch.can_retry:
                 logger.info("Повтор батча %s (попытка %d", batch.id, batch.attempt + 1)
-                batch = process_batch(batch, extractor_factory, scanner)
+                batch = pool.submit(
+                    process_batch,
+                    batch,
+                    extractor_factory,
+                    scanner,
+                ).result()
+                worker_name = batch.metadata.get("worker_name", threading.current_thread().name)
+                bar = _get_worker_progress_bar(worker_name, len(batches))
+                bar.update(1)
 
             if batch.status == BatchStatus.DONE:
                 reporter.add(batch.to_report())
@@ -76,6 +116,10 @@ def run(dataset_path: Path, output_dir: Path, workers: int):
     paths = reporter.write()
     for fmt, path in paths.items():
         logger.info("Отчёт [%s]: %s", fmt, path)
+
+    for bar in worker_progress_bars.values():
+        bar.close()
+    worker_progress_bars.clear()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PII Detection Pipeline")
