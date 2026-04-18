@@ -22,32 +22,35 @@ ImageLike = Any
 TableFrame = Any
 ExtractorHandler = Callable[['FileExtractor', str, 'ExtractContext'], str]
 
-
-@dataclass(frozen=True)
+"""Неизменяемый контейнер параметров, управляющих поведением экстрактора"""
+@dataclass(frozen=True) # Данный декоратор делает конфигурацию иммутабельной и потокобезопасной
 class ExtractConfig:
-    enable_ocr: bool = True
-    image_rotate_passes: int = 1
-    video_max_seconds: float = 120.0
-    video_fps_sample: float = 2.0
-    max_pdf_pages: int = 200
-    max_table_rows: int = 1000
-    max_json_chars: int = 200000
-    max_chars: int = 200000
+    enable_ocr: bool = True # Вкл/Выкл оптическое распознавание. Позволяет откл. Тяжелый OCR на слабых машинах
+    image_rotate_passes: int = 3 # Сколько доп поворотов изображения пробовать для OCR. Повышает точность
+    video_max_seconds: float = 120.0 # Макс время видео для анализа
+    video_fps_sample: float = 1.0 # Частота сэмплирования кадров
+    max_pdf_pages: int = 200 # Лимит страниц PDF
+    max_table_rows: int = 1000 # Лимит строк для таблиц
+    max_json_chars: int = 200000 # Лимит символов в JSON-файлах после парсинга
+    max_chars: int = 200000 # Общий лимит итогового текста на файл
 
-
+'''Стандартизированный объект-результат обработки одного файла.'''
 @dataclass
 class ExtractResult:
-    file_path: str
-    text: str
-    status: ExtractStatus
-    extractor: str
-    warnings: List[str] = field(default_factory=list)
-    error: Optional[str] = None
+    file_path: str # Полный путь к обработанному файлу
+    text: str # Извлеченный и нормализованный текст. Возращает пустую строку, если извлечь не удалось
+    status: ExtractStatus # На основе полученного литерала определяет дальнейшую логику обработки
+    extractor: str # Имя вызванного хендлера
+    warnings: List[str] = field(default_factory=list) # Список предупреждений
+    error: Optional[str] = None # Текст исключения
 
-
+'''
+Назначение: мутируемый "контекстный мешок", передаваемый внутрь каждого метода экстрактора.
+Содержит текущие настройки и аккумулирует побочные эффекты обработки.
+'''
 @dataclass
 class ExtractContext:
-    config: ExtractConfig
+    config: ExtractConfig # Ссылка на активный конфиг. Хендлеры читают из неё лимиты и флаги.
     warnings: List[str] = field(default_factory=list)
     handler_name: str = ''
 
@@ -88,21 +91,29 @@ class FileExtractor:
 
     @classmethod
     def _get_reader(cls) -> easyocr.Reader:
+        """
+        Возвращает общий экземпляр OCR-ридера.
+        :return: Инициализированный easyocr.Reader
+        """
         if cls._reader is None:
             cls._reader = easyocr.Reader(['ru', 'en'], gpu=False)
         return cls._reader
 
     @classmethod
-    def extract(
-        cls, file_path: str, config: Optional[ExtractConfig] = None
-    ) -> ExtractResult:
+    def extract(cls, file_path: str, config: Optional[ExtractConfig] = None) -> ExtractResult:
+        """
+        Определяет расширение файла.
+        :param file_path: 
+        :param config:
+        :return:
+        """
         ext: str = os.path.splitext(file_path)[1].lower()
         handler_name = cls._handlers.get(ext)
         active_config = config or cls._default_config
         context = ExtractContext(config=active_config)
 
         if handler_name is None:
-            warning = f'Unsupported file extension: {ext or "<none>"}'
+            warning = f'Неподдерживаемое расширение файла: {ext or "<none>"}'
             logger.warning('%s (%s)', warning, file_path)
             return ExtractResult(
                 file_path=file_path,
@@ -120,7 +131,9 @@ class FileExtractor:
             text = handler(file_path, context)
         except Exception as exc:
             logger.exception(
-                'Extractor %s failed for %s', handler_name, os.path.basename(file_path)
+                'Экстрактор %s завершился с ошибкой для %s',
+                handler_name,
+                os.path.basename(file_path),
             )
             return ExtractResult(
                 file_path=file_path,
@@ -136,7 +149,7 @@ class FileExtractor:
 
         if status in ('failed', 'partial'):
             logger.warning(
-                'Extractor %s completed with status %s for %s: %s',
+                'Экстрактор %s завершился со статусом %s для %s: %s',
                 handler_name,
                 status,
                 os.path.basename(file_path),
@@ -144,7 +157,7 @@ class FileExtractor:
             )
         elif status == 'empty':
             logger.info(
-                'Extractor %s returned empty text for %s',
+                'Экстрактор %s вернул пустой текст для %s',
                 handler_name,
                 os.path.basename(file_path),
             )
@@ -159,10 +172,22 @@ class FileExtractor:
 
     @classmethod
     def extract_text(cls, file_path: str, config: Optional[ExtractConfig] = None) -> str:
+        """
+        Возвращает только текст без полного объекта результата.
+        :param file_path:
+        :param config:
+        :return:
+        """
         return cls.extract(file_path, config=config).text
 
     @staticmethod
     def _resolve_status(text: str, warnings: Sequence[str]) -> ExtractStatus:
+        """
+        Определяет итоговый статус извлечения по тексту и предупреждениям.
+        :param text:
+        :param warnings:
+        :return:
+        """
         if not text.strip():
             if warnings:
                 return 'partial'
@@ -173,20 +198,36 @@ class FileExtractor:
 
     @staticmethod
     def _finalize_text(text: str, context: ExtractContext) -> str:
+        """
+        Нормализует пробелы и ограничивает итоговую длину текста.
+        :param text:
+        :param context:
+        :return:
+        """
         collapsed = ' '.join(text.split())
         if len(collapsed) > context.config.max_chars:
             context.warnings.append(
-                f'Text truncated to {context.config.max_chars} characters'
+                f'Текст обрезан до {context.config.max_chars} символов'
             )
             return collapsed[: context.config.max_chars]
         return collapsed
 
     @staticmethod
     def _normalize_block(value: Any) -> str:
+        """
+        Приводит блок данных к строке с нормализованными пробелами.
+        :param value:
+        :return:
+        """
         return ' '.join(str(value).split())
 
     @classmethod
     def _merge_blocks(cls, blocks: Sequence[str]) -> str:
+        """
+        Объединяет текстовые блоки, удаляя пустые и повторяющиеся значения.
+        :param blocks:
+        :return:
+        """
         unique_blocks: List[str] = []
         seen: set[str] = set()
         for block in blocks:
@@ -199,19 +240,33 @@ class FileExtractor:
 
     @staticmethod
     def _truncate_text(text: str, limit: int, context: ExtractContext, label: str) -> str:
+        """
+        Обрезает текст до лимита и фиксирует предупреждение в контексте.
+        :param text:
+        :param limit:
+        :param context:
+        :param label:
+        :return:
+        """
         if len(text) > limit:
-            context.warnings.append(f'{label} truncated to {limit} characters')
+            context.warnings.append(f'{label} обрезан до {limit} символов')
             return text[:limit]
         return text
 
     def _extract_pdf(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Извлекает текст со страниц PDF в пределах настроенного лимита.
+        :param file_path:
+        :param context:
+        :return:
+        """
         text_blocks: List[str] = []
         with fitz.open(file_path) as doc:
             page_count = len(doc)
             page_limit = min(page_count, context.config.max_pdf_pages)
             if page_count > page_limit:
                 context.warnings.append(
-                    f'PDF limited to first {page_limit} pages out of {page_count}'
+                    f'PDF ограничен первыми {page_limit} страницами из {page_count}'
                 )
 
             for page_index in range(page_limit):
@@ -220,6 +275,12 @@ class FileExtractor:
         return self._merge_blocks(text_blocks)
 
     def _extract_docx(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Извлекает текст из абзацев и таблиц документа DOCX.
+        :param file_path:
+        :param context:
+        :return:
+        """
         doc = docx.Document(file_path)
         parts: List[str] = [paragraph.text for paragraph in doc.paragraphs]
         for table in doc.tables:
@@ -229,10 +290,16 @@ class FileExtractor:
         return self._merge_blocks(parts)
 
     def _extract_doc(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Извлекает текст из DOC через внешнюю утилиту antiword.
+        :param file_path:
+        :param context:
+        :return:
+        """
         antiword_path = shutil.which('antiword')
         if antiword_path is None:
             context.warnings.append(
-                '.doc extraction requires antiword; file marked as partially supported'
+                'Для извлечения .doc требуется antiword; файл помечен как частично поддерживаемый'
             )
             return ''
 
@@ -245,17 +312,29 @@ class FileExtractor:
             check=False,
         )
         if completed.returncode != 0:
-            stderr = completed.stderr.strip() or 'antiword failed without stderr'
+            stderr = completed.stderr.strip() or 'antiword завершился с ошибкой без вывода stderr'
             raise RuntimeError(stderr)
         return completed.stdout
 
     def _extract_rtf(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Считывает RTF-файл и преобразует его содержимое в обычный текст.
+        :param file_path:
+        :param context:
+        :return:
+        """
         raw_text = self._read_text_with_fallback(file_path, context)
         if not raw_text:
             return ''
         return str(rtf_to_text(raw_text))
 
     def _extract_table(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Определяет формат табличного файла и сериализует его в текст.
+        :param file_path:
+        :param context:
+        :return:
+        """
         ext = os.path.splitext(file_path)[1].lower()
         if ext == '.csv':
             df = self._read_csv_with_fallback(file_path, context)
@@ -271,6 +350,13 @@ class FileExtractor:
     def _read_csv_with_fallback(
         self, file_path: str, context: ExtractContext, delimiter: str = ','
     ) -> TableFrame:
+        """
+        Пытается прочитать CSV/TSV в нескольких кодировках.
+        :param file_path:
+        :param context:
+        :param delimiter:
+        :return:
+        """
         encodings = ('utf-8-sig', 'utf-8', 'cp1251', 'latin-1')
         last_decode_error: Optional[str] = None
 
@@ -293,20 +379,26 @@ class FileExtractor:
 
         if last_decode_error:
             raise UnicodeDecodeError('csv', b'', 0, 1, last_decode_error)
-        raise ValueError(f'Unable to decode table file: {file_path}')
+        raise ValueError(f'Не удалось декодировать файл таблицы: {file_path}')
 
     def _serialize_table(self, df: TableFrame, context: ExtractContext) -> str:
+        """
+        Преобразует таблицу DataFrame в компактное текстовое представление.
+        :param df:
+        :param context:
+        :return:
+        """
         if df.empty:
             return ''
 
         limited_df = df.head(context.config.max_table_rows).fillna('')
         if len(df.index) > len(limited_df.index):
             context.warnings.append(
-                f'Table limited to first {len(limited_df.index)} rows out of {len(df.index)}'
+                f'Таблица ограничена первыми {len(limited_df.index)} строками из {len(df.index)}'
             )
 
         columns = [str(column) for column in limited_df.columns]
-        lines: List[str] = [f'Columns: {", ".join(columns)}']
+        lines: List[str] = [f'Столбцы: {", ".join(columns)}']
 
         for _, row in limited_df.iterrows():
             parts = []
@@ -320,14 +412,26 @@ class FileExtractor:
         return '\n'.join(lines)
 
     def _extract_json(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Загружает JSON и сериализует его в человекочитаемый текст.
+        :param file_path:
+        :param context:
+        :return:
+        """
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
             data = json.load(file)
         serialized = json.dumps(data, ensure_ascii=False, indent=2)
         return self._truncate_text(
-            serialized, context.config.max_json_chars, context, 'JSON payload'
+            serialized, context.config.max_json_chars, context, 'JSON-данные'
         )
 
     def _extract_html(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Считывает HTML/XML и извлекает из него видимый текст.
+        :param file_path:
+        :param context:
+        :return:
+        """
         raw_text = self._read_text_with_fallback(file_path, context)
         if not raw_text:
             return ''
@@ -335,9 +439,21 @@ class FileExtractor:
         return soup.get_text(separator=' ', strip=True)
 
     def _extract_plain_text(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Считывает обычный текстовый файл с подбором кодировки.
+        :param file_path:
+        :param context:
+        :return:
+        """
         return self._read_text_with_fallback(file_path, context)
 
     def _read_text_with_fallback(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Пытается прочитать текстовый файл в нескольких распространённых кодировках.
+        :param file_path:
+        :param context:
+        :return:
+        """
         last_error: Optional[str] = None
         for encoding in ('utf-8-sig', 'utf-8', 'cp1251', 'latin-1'):
             try:
@@ -347,10 +463,18 @@ class FileExtractor:
                 last_error = str(exc)
                 continue
         if last_error:
-            context.warnings.append(f'Unable to decode text file cleanly: {last_error}')
+            context.warnings.append(
+                f'Не удалось корректно декодировать текстовый файл: {last_error}'
+            )
         return ''
 
     def _preprocess_for_ocr(self, image: ImageLike, mode: str) -> ImageLike:
+        """
+        Подготавливает изображение к OCR в зависимости от сценария обработки.
+        :param image:
+        :param mode:
+        :return:
+        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         if mode in {'document', 'video_frame'}:
             processed = cv2.adaptiveThreshold(
@@ -368,8 +492,15 @@ class FileExtractor:
     def _run_ocr(
         self, image: ImageLike, context: ExtractContext, rotate_passes: int
     ) -> str:
+        """
+        Запускает OCR для изображения с дополнительными поворотами кадра.
+        :param image:
+        :param context:
+        :param rotate_passes:
+        :return:
+        """
         if not context.config.enable_ocr:
-            context.warnings.append('OCR disabled by configuration')
+            context.warnings.append('OCR отключён в конфигурации')
             return ''
 
         reader = self._get_reader()
@@ -384,9 +515,15 @@ class FileExtractor:
         return self._merge_blocks(blocks)
 
     def _extract_image(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Загружает изображение, подготавливает его и извлекает текст через OCR.
+        :param file_path:
+        :param context:
+        :return:
+        """
         image = cv2.imread(file_path)
         if image is None:
-            raise ValueError('OpenCV failed to load image')
+            raise ValueError('OpenCV не удалось загрузить изображение')
 
         processed = self._preprocess_for_ocr(image, mode='document')
         return self._run_ocr(
@@ -394,13 +531,19 @@ class FileExtractor:
         )
 
     def _extract_video(self, file_path: str, context: ExtractContext) -> str:
+        """
+        Извлекает текст из видео по выбранным кадрам в пределах заданного лимита.
+        :param file_path:
+        :param context:
+        :return:
+        """
         if not context.config.enable_ocr:
-            context.warnings.append('Video OCR disabled by configuration')
+            context.warnings.append('OCR для видео отключён в конфигурации')
             return ''
 
         capture = cv2.VideoCapture(file_path)
         if not capture.isOpened():
-            raise ValueError('OpenCV failed to open video')
+            raise ValueError('OpenCV не удалось открыть видео')
 
         fps_raw = capture.get(cv2.CAP_PROP_FPS)
         fps_value = float(fps_raw) if fps_raw and fps_raw > 0 else 24.0
@@ -415,8 +558,8 @@ class FileExtractor:
         try:
             if total_seconds > context.config.video_max_seconds:
                 context.warnings.append(
-                    'Video OCR limited to first '
-                    f'{context.config.video_max_seconds:.1f} seconds out of '
+                    'OCR для видео ограничен первыми '
+                    f'{context.config.video_max_seconds:.1f} секундами из '
                     f'{total_seconds:.1f}'
                 )
 
