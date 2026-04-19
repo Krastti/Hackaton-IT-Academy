@@ -9,12 +9,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
 
-from router import Router
-from batcher import Batch, BatchStatus
-from reporter import Reporter
-from scanner import Scanner
-from extractor import ExtractorFactory
-
+from src.router import Router
+from src.batcher import Batch, BatchStatus
+from src.reporter import Reporter
+from src.scanner import Scanner
+from src.extractor import ExtractorFactory
 
 class TqdmLoggingHandler(logging.Handler):
     """Writes log records above the active tqdm bar without breaking it."""
