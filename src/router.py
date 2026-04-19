@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 
-from batcher import Batch
+from .batcher import Batch
 
 logger = logging.getLogger(__name__)
 
