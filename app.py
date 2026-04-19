@@ -3,6 +3,7 @@ import logging
 import sys
 import threading
 import warnings
+import io
 
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +15,11 @@ from src.batcher import Batch, BatchStatus
 from src.reporter import Reporter
 from src.scanner import Scanner
 from src.extractor import ExtractorFactory
+
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 class TqdmLoggingHandler(logging.Handler):
     """Writes log records above the active tqdm bar without breaking it."""
