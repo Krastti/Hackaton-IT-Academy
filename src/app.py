@@ -1,98 +1,49 @@
 import os
-import csv
-import json
-from pathlib import Path
-from typing import Dict, Any, List, Set, Optional, cast
+import logging
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from typing import Dict, Any, List, Set, cast
 from collections import defaultdict
-from datetime import datetime
 
-from tqdm import tqdm  # type: ignore
-from extractor import FileExtractor  # type: ignore
-from analyzer import PIIAnalyzer  # type: ignore
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
+from tqdm import tqdm
+try:
+    from extractor import ExtractConfig, ExtractResult
+    from reporter import PIIReporter
+    from batch_router import collect_files, chunk_files, process_batch, ScanOutcome
+except ImportError:
+    from extractor import ExtractConfig, ExtractResult  # type: ignore
+    from reporter import PIIReporter  # type: ignore
+    from batch_router import collect_files, chunk_files, process_batch, ScanOutcome  # type: ignore
 
-# Порог «большого объёма» по ТЗ: «десятки тысяч записей»
-LARGE_VOLUME_THRESHOLD: int = 1000
-
-# Человекочитаемые названия конкретных сущностей
-CATEGORY_LABELS: Dict[str, str] = {
-    'fio':            'ФИО',
-    'email':          'Email',
-    'phone':          'Телефон',
-    'address':        'Адрес',
-    'passport':       'Паспорт', # ИСПРАВЛЕНО: было passport_rf
-    'snils':          'СНИЛС',
-    'inn':            'ИНН',
-    'driver_license': 'Водительское удостоверение',
-    'bank_card':      'Банковская карта',
-    'bik':            'БИК',
-    'cvv':            'CVV/CVC',
-    'special_pii':    'Спецкатегории / Биометрия',
-}
-
-# ДОБАВЛЕНО: Человекочитаемые названия мета-категорий для отчета
-META_CATEGORY_LABELS: Dict[str, str] = {
-    'common_pii':     'Общие ПДн',
-    'gov_ids':        'Гос. идентификаторы',
-    'payment_info':   'Платёжные данные',
-    'special_pii':    'Спец. ПДн / Биометрия'
-}
-
-# Рекомендации по обработке в зависимости от УЗ
-UZ_RECOMMENDATIONS: Dict[str, str] = {
-    'УЗ-1': (
-        'ВЫСОКИЙ РИСК. Требуется немедленное выполнение требований 152-ФЗ: '
-        'назначить ответственного за обработку ПДн, провести инвентаризацию, '
-        'ограничить доступ, организовать шифрование, уведомить Роскомнадзор.'
-    ),
-    'УЗ-2': (
-        'ПОВЫШЕННЫЙ РИСК. Платёжные данные или объёмные госидентификаторы. '
-        'Необходимо внедрить контроль доступа, журналирование и периодический аудит.'
-    ),
-    'УЗ-3': (
-        'СРЕДНИЙ РИСК. Ограниченный объём госидентификаторов или большой объём '
-        'обычных ПДн. Рекомендуется псевдонимизация и разграничение прав доступа.'
-    ),
-    'УЗ-4': (
-        'БАЗОВЫЙ УРОВЕНЬ. Небольшой объём обычных ПДн. '
-        'Достаточно базовых организационных мер и политики конфиденциальности.'
-    ),
-    'Безопасно': 'ПДн не обнаружены. Специальных мер не требуется.',
-}
-
-
-def _get_recommendation(uz: str) -> str:
-    return UZ_RECOMMENDATIONS.get(uz, '')
-
+logger = logging.getLogger(__name__)
 
 class PIIController:
-    def __init__(self, target_dir: str, output_prefix: str = 'report') -> None:
+    def __init__(
+        self,
+        target_dir: str,
+        output_prefix: str = 'report',
+        extract_config: ExtractConfig | None = None,
+        chunk_size: int = 100,
+        max_workers: int | None = None,
+    ) -> None:
         self.target_dir: str = target_dir
         self.output_prefix: str = output_prefix
-        self.analyzer: PIIAnalyzer = PIIAnalyzer()
-        self.extractor: FileExtractor = FileExtractor()
+        self.extract_config: ExtractConfig = extract_config or ExtractConfig()
+        if chunk_size <= 0:
+            raise ValueError('chunk_size must be a positive integer')
+        self.chunk_size: int = chunk_size
+
+        resolved_workers = max_workers if max_workers is not None else min(4, os.cpu_count() or 1)
+        if resolved_workers <= 0:
+            raise ValueError('max_workers must be a positive integer')
+        self.max_workers: int = resolved_workers
+        self.reporter: PIIReporter = PIIReporter(output_prefix)
 
         # {путь: {stats, raw_data}}
         self.file_registry: Dict[str, Dict[str, Any]] = {}
+        self.extraction_registry: Dict[str, ExtractResult] = {}
         # {нормализованное_значение: {набор_путей}}
         self.anchor_index: Dict[str, Set[str]] = defaultdict(set)
-
-    def _determine_uz(self, stats: Dict[str, int]) -> str:
-        spec: int = int(stats.get('special_pii', 0))
-        pay:  int = int(stats.get('payment_info', 0))
-        gov:  int = int(stats.get('gov_ids', 0))
-        com:  int = int(stats.get('common_pii', 0))
-
-        if spec > 0:
-            return 'УЗ-1'
-        if pay > LARGE_VOLUME_THRESHOLD or gov > LARGE_VOLUME_THRESHOLD:
-            return 'УЗ-2'
-        if (0 < gov <= LARGE_VOLUME_THRESHOLD) or com > LARGE_VOLUME_THRESHOLD:
-            return 'УЗ-3'
-        if 0 < com <= LARGE_VOLUME_THRESHOLD:
-            return 'УЗ-4'
-        return 'Безопасно'
 
     def _find_groups(self) -> List[Set[str]]:
         """Алгоритм поиска связанных компонентов (Union-Find по якорям)."""
@@ -113,8 +64,7 @@ class PIIController:
                     raw_data: Dict[str, List[str]] = cast(
                         Dict[str, List[str]], node_data.get('raw_data', {})
                     )
-                    # ИСПРАВЛЕНО: заменили passport_rf на passport
-                    for category in ['email', 'phone', 'snils', 'inn', 'passport']:
+                    for category in ['email', 'phone', 'snils', 'inn', 'passport_rf']:
                         for value in raw_data.get(category, []):
                             for linked_file in self.anchor_index.get(value, set()):
                                 if linked_file not in visited:
@@ -124,40 +74,76 @@ class PIIController:
                 groups.append(current_group)
         return groups
 
+    def _merge_outcome(self, outcome: ScanOutcome) -> None:
+        f_path = outcome.file_path
+        self.extraction_registry[f_path] = outcome.extraction
+
+        if outcome.analysis is None:
+            return
+
+        self.file_registry[f_path] = outcome.analysis
+        for category, values in outcome.anchors.items():
+            for value in values:
+                self.anchor_index[value].add(f_path)
+
     def run_scan(self) -> None:
         # ----------------------------------------------------------------
         # Шаг 1: сканирование
         # ----------------------------------------------------------------
         print('[*] Шаг 1: Сканирование и сбор якорей...')
-        all_files: List[str] = []
+        scan_started_at = time.perf_counter()
+        all_files = collect_files(self.target_dir)
+        batches = chunk_files(all_files, chunk_size=self.chunk_size)
 
-        # Сначала просто собираем ВСЕ пути ко всем файлам в список
-        for root, _, files in os.walk(self.target_dir):
-            for f in files:
-                all_files.append(os.path.join(root, f))
+        logger.info(
+            'Найдено %s файлов для обработки. Батчей: %s. Размер батча: %s. Потоков: %s',
+            len(all_files),
+            len(batches),
+            self.chunk_size,
+            self.max_workers,
+        )
 
-        # Вышли из цикла os.walk! Теперь создаем прогресс-бар один раз
-        pbar = tqdm(all_files, desc='Сканирование', unit='файл')
+        future_to_batch_index: Dict[Future[List[ScanOutcome]], int] = {}
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            for batch_index, batch in enumerate(batches, start=1):
+                logger.info(
+                    'Запуск батча %s/%s (%s файлов)',
+                    batch_index,
+                    len(batches),
+                    len(batch),
+                )
+                future = executor.submit(process_batch, batch, self.extract_config)
+                future_to_batch_index[future] = batch_index
 
-        # Запускаем цикл обработки файлов
-        for f_path in pbar:
-            # Обновляем имя файла в консоли
-            pbar.set_postfix_str(f"Файл: {os.path.basename(f_path)}")
+            for future in tqdm(
+                as_completed(future_to_batch_index),
+                total=len(future_to_batch_index),
+                desc='Обработка батчей',
+                unit='батч',
+            ):
+                batch_index = future_to_batch_index[future]
+                batch_outcomes = future.result()
 
-            # Извлекаем текст
-            text: str = str(self.extractor.extract_text(f_path))
+                status_counts: Dict[str, int] = defaultdict(int)
+                for outcome in batch_outcomes:
+                    self._merge_outcome(outcome)
+                    status_counts[outcome.extraction.status] += 1
 
-            # ВАЖНО: Анализ и сохранение должны быть ВНУТРИ этого цикла (с отступом)
-            res: Dict[str, Any] = self.analyzer.analyze_text(text)
-            self.file_registry[f_path] = res
+                logger.info(
+                    'Завершён батч %s/%s: success=%s partial=%s empty=%s failed=%s unsupported=%s',
+                    batch_index,
+                    len(batches),
+                    status_counts.get('success', 0),
+                    status_counts.get('partial', 0),
+                    status_counts.get('empty', 0),
+                    status_counts.get('failed', 0),
+                    status_counts.get('unsupported', 0),
+                )
 
-            raw_data: Dict[str, List[str]] = cast(
-                Dict[str, List[str]], res.get('raw_data', {})
-            )
-
-            for cat in ['email', 'phone', 'snils', 'inn', 'passport']:
-                for val in raw_data.get(cat, []):
-                    self.anchor_index[val].add(f_path)
+        logger.info(
+            'Этап сканирования завершён за %.2f сек.',
+            time.perf_counter() - scan_started_at,
+        )
 
         # ----------------------------------------------------------------
         # Шаг 2: группировка
@@ -165,158 +151,14 @@ class PIIController:
         print('[*] Шаг 2: Группировка файлов и классификация...')
         groups: List[Set[str]] = self._find_groups()
 
-        report_rows: List[Dict[str, Any]] = []
-
-        for group_id, group_files in enumerate(groups, start=1):
-            group_raw_union: Dict[str, Set[str]] = defaultdict(set)
-            group_special_pii_total: int = 0
-
-            for f_path in group_files:
-                f_res: Dict[str, Any] = self.file_registry[f_path]
-                raw_data = cast(Dict[str, List[str]], f_res.get('raw_data', {}))
-                f_stats = cast(Dict[str, int], f_res.get('stats', {}))
-
-                for cat, items in raw_data.items():
-                    group_raw_union[cat].update(items)
-
-                group_special_pii_total += int(f_stats.get('special_pii', 0))
-
-            # ИСПРАВЛЕНО: используем ключ passport вместо passport_rf для подсчета госидентификаторов
-            group_stats: Dict[str, int] = {
-                'common_pii': (
-                    len(group_raw_union['fio']) + len(group_raw_union['email']) +
-                    len(group_raw_union['phone']) + len(group_raw_union['address'])
-                ),
-                'gov_ids': (
-                    len(group_raw_union['passport']) + len(group_raw_union['snils']) +
-                    len(group_raw_union['inn']) + len(group_raw_union['driver_license'])
-                ),
-                'payment_info': (
-                    len(group_raw_union['bank_card']) + len(group_raw_union['bik']) +
-                    len(group_raw_union['cvv'])
-                ),
-                'special_pii': group_special_pii_total,
-            }
-
-            group_categories: Set[str] = {k for k, v in group_stats.items() if v > 0}
-            group_counts: Dict[str, int] = {
-                cat: len(vals)
-                for cat, vals in group_raw_union.items() if vals
-            }
-
-            uz_level: str = self._determine_uz(group_stats)
-            recommendation: str = _get_recommendation(uz_level)
-
-            for f_path in group_files:
-                row: Dict[str, Any] = {
-                    'path': f_path,
-                    'group_id': f'Группа_{group_id}',
-                    # ИСПРАВЛЕНО: Переводим мета-категории (common_pii -> Общие ПДн) правильным словарем
-                    'categories': [
-                        META_CATEGORY_LABELS.get(c, c) for c in sorted(group_categories)
-                    ],
-                    # Здесь переводятся конкретные сущности (fio -> ФИО, passport -> Паспорт)
-                    'counts': {
-                        CATEGORY_LABELS.get(k, k): v
-                        for k, v in group_counts.items() if v > 0
-                    },
-                    'uz': uz_level,
-                    'file_format': Path(f_path).suffix,
-                    'recommendation': recommendation,
-                }
-                report_rows.append(row)
-
         # ----------------------------------------------------------------
         # Шаг 3: запись отчётов
         # ----------------------------------------------------------------
-        self._write_csv(report_rows)
-        self._write_json(report_rows)
-        self._write_markdown(report_rows, groups)
+        self.reporter.write_reports(self.file_registry, groups)
 
         print(f'[+] Отчёты: {self.output_prefix}.csv / .json / .md')
 
-    # --------------------------------------------------------------------
-    # Форматы отчётов
-    # --------------------------------------------------------------------
-
-    def _write_csv(self, rows: List[Dict[str, Any]]) -> None:
-        path = self.output_prefix + '.csv'
-        with open(path, mode='w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.writer(f, delimiter=';')
-            writer.writerow([
-                'Путь', 'ID_Группы', 'Категории_ПДн',
-                'Количество_находок', 'УЗ', 'Формат', 'Рекомендации',
-            ])
-            for row in rows:
-                cats = ', '.join(row['categories']) if row['categories'] else '—'
-                counts = '; '.join(
-                    f"{k}: {v}" for k, v in row['counts'].items()
-                )
-                writer.writerow([
-                    row['path'], row['group_id'], cats,
-                    counts, row['uz'], row['file_format'],
-                    row['recommendation'],
-                ])
-
-    def _write_json(self, rows: List[Dict[str, Any]]) -> None:
-        path = self.output_prefix + '.json'
-        output = {
-            'generated_at': datetime.now().isoformat(),
-            'total_files': len(rows),
-            'results': rows,
-        }
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(output, f, ensure_ascii=False, indent=2)
-
-    def _write_markdown(
-        self, rows: List[Dict[str, Any]], groups: List[Set[str]]
-    ) -> None:
-        path = self.output_prefix + '.md'
-
-        uz_counter: Dict[str, int] = defaultdict(int)
-        for row in rows:
-            uz_counter[row['uz']] += 1
-
-        lines: List[str] = [
-            '# Отчёт PII-сканера',
-            f'',
-            f'**Дата:** {datetime.now().strftime("%d.%m.%Y %H:%M")}  ',
-            f'**Файлов обработано:** {len(rows)}  ',
-            f'**Групп найдено:** {len(groups)}',
-            '',
-            '## Сводка по уровням защищённости',
-            '',
-            '| УЗ | Количество файлов |',
-            '|----|-------------------|',
-        ]
-        for uz in ['УЗ-1', 'УЗ-2', 'УЗ-3', 'УЗ-4', 'Безопасно']:
-            lines.append(f'| {uz} | {uz_counter.get(uz, 0)} |')
-
-        lines += [
-            '',
-            '## Детализация по файлам',
-            '',
-            '| Путь | Группа | Категории ПДн | УЗ | Формат |',
-            '|------|--------|---------------|----|--------|',
-        ]
-        for row in rows:
-            cats = ', '.join(row['categories']) if row['categories'] else '—'
-            name = Path(row['path']).name
-            lines.append(
-                f'| `{name}` | {row["group_id"]} | {cats} '
-                f'| **{row["uz"]}** | {row["file_format"]} |'
-            )
-
-        lines += ['', '## Рекомендации', '']
-        for uz, rec in UZ_RECOMMENDATIONS.items():
-            lines.append(f'### {uz}')
-            lines.append(f'{rec}')
-            lines.append('')
-
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-
 
 if __name__ == '__main__':
-    app = PIIController('../test_dataset', 'report')
+    app = PIIController('../TestDataset', 'report')
     app.run_scan()
