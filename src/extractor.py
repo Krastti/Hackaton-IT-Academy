@@ -1,13 +1,11 @@
 import logging
 import pdfplumber
 import pandas as pd
-import pytesseract
 import easyocr
 
 from abc import ABC, abstractmethod
 from pathlib import Path
 from docx import Document
-from PIL import Image
 
 logger = logging.getLogger(__name__)
 
