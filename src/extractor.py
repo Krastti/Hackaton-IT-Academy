@@ -1,6 +1,7 @@
 import logging
 import json
 import re
+import zipfile
 import pdfplumber
 import pandas as pd
 import easyocr
@@ -75,8 +76,12 @@ class DocExtractor(BaseExtractor):
             if text and text.strip():
                 logger.info("DOC извлечён через docx2txt: %s", file_path.name)
                 return text
-        except Exception:
-            pass
+        except (OSError, ValueError, zipfile.BadZipFile) as e:
+            logger.warning(
+                "Не удалось извлечь DOC через docx2txt %s: %s. Переходим к fallback.",
+                file_path.name,
+                e,
+            )
 
         # Fallback: бинарное чтение с поиском кириллицы и цифр
         try:
@@ -86,7 +91,7 @@ class DocExtractor(BaseExtractor):
             cleaned = re.sub(r"[^\w\s@.,\-]", " ", text_utf16 + " " + text_cp1251)
             logger.info("DOC извлечён через бинарное чтение: %s", file_path.name)
             return cleaned
-        except Exception as e:
+        except OSError as e:
             logger.error("Ошибка чтения DOC %s: %s", file_path.name, e)
             return ""
 
@@ -124,7 +129,7 @@ class CSVExtractor(BaseExtractor):
                     on_bad_lines="skip", low_memory=False,
                 )
                 break
-            except (UnicodeDecodeError, Exception):
+            except (UnicodeDecodeError, pd.errors.ParserError, ValueError, OSError):
                 continue
         if df is None:
             return ""
@@ -226,7 +231,7 @@ class VideoExtractor(BaseExtractor):
                 res = reader.readtext(frame_proc, detail=0, paragraph=True, workers=0)
                 if res:
                     text_blocks.append(" ".join(res))
-            except Exception as e:
+            except (RuntimeError, ValueError, cv2.error) as e:
                 logger.warning("OCR кадра упал: %s", e)
 
             frame_idx = int(frame_idx + step)
